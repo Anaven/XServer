@@ -1,0 +1,82 @@
+#ifndef __VIDEO_CLIENT__
+#define __VIDEO_CLIENT__
+
+#include "StrPtrLen.h"
+#include "Client.h"
+#include "NetStream.h"
+
+
+#define VIDEO_CLIENT_DEBUG 1
+
+class MessageClient : public Client
+{
+	public:
+
+    	MessageClient(char* theAuthName, char* theDeviceID, NetStream* theStream);
+        ~MessageClient() { fServer->DecreaseNumMessageSession(); };
+
+		int		Enroll();
+		void	Unenroll();
+		
+		int 	ProcessPacket(char* thePacket, UInt32 thePacketLen);
+		void 	Kill(char* theID, int theCode);
+		int 	SendPacket(char* inData, UInt32 inLength);
+
+		int 	BeginAuthorization();
+		void 	EndAuthorization();
+		
+		bool 	HasAuthorizor(MessageClient* theClient);
+		bool 	HasUser(MessageClient* theClient);
+
+		char* GetUserName() { MutexLocker theLocker(&fMutex); return fUserName; };
+		StrPtrLen* GetUserNameStr() { MutexLocker theLocker(&fMutex); return &fUserNameStr; };
+
+		void 	AddObserver(MessageClient* theClient);
+		void 	RemoveObserver(MessageClient* theClient);
+		bool	HasObserver(MessageClient* theClient);
+
+		int		GetObserverNum() { MutexLocker theLocker(&fMutex); return fObserverNum; };
+    	void 	LuanchExpireTime(SInt64 theTimeInMilSec);
+
+		void 	Broadcast() {};
+		void	KillAllClients(int theCode);
+		bool 	IsAllowObserve() { MutexLocker theLocker(&fMutex); return fAllowObserve; };
+
+		void	Cleanup();
+
+	private:
+
+		void SendSessionNotFound();
+		void SendUserEnroll();
+		void SendAuthorityError();
+		void SendObserverEnroll();
+		void SendObserverSaturated();
+		void SendAllowObserve();
+		void SendDisallowObserve();
+
+		void PostUserEnroll();
+		void PostUserUnenroll();
+
+		void PostObserverEnroll();
+		void PostObserverUnenroll();
+
+		int		fObserverNum;
+		bool	fAllowObserve;
+		
+		char*		fUserName;
+		StrPtrLen 	fUserNameStr;
+			
+        char fAuthName[kAuthNameSize];
+		char fDeviceID[kDeviceIDSize];
+		StrPtrLen fDeviceIDStr;
+		
+		NetStream* 		fNetStream;
+		KeepAliveTask	fKeepAliveTask;
+
+		
+		Ref			fAuthRef;
+		RefTable 	fObserverRefTable;
+};
+
+#endif
+

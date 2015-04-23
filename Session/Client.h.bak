@@ -1,0 +1,19 @@
+#ifndef __CLIENT__
+#define __CLIENT__
+
+#include "Session.h"
+
+#define CLIENT_DEBUG 1
+
+#include "Mutex.h"
+
+class Client
+{
+	public:
+
+    	Client();
+        virtual ~Client();
+};
+
+#endif
+

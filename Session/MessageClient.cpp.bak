@@ -1,0 +1,22 @@
+#include "MessageDevice.h"
+#include "AServer.h"
+
+
+MessageDevice::MessageDevice(char* theDeviceID, NetStream* theStream)
+ : fNetStream(theStream)
+{ 
+    strncpy(fDeviceID, theDeviceID, kDeviceIDSize);
+	fDeviceIDStr.Set(fDeviceID);
+	fRef.Set(fDeviceIDStr, this);
+};
+
+int MessageDevice::ProcessPacket(char* thePacket, UInt32 thePacketLen)
+{
+	return 0;
+}
+
+int MessageDevice::Enroll()
+{
+	return 0;
+}
+

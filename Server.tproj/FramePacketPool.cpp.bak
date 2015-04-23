@@ -1,0 +1,113 @@
+/*
+    File:       PacketPool.cpp
+
+    Contains:   PacketPool class to buffer and track re-transmits of RTP packets.
+    
+    
+*/
+
+#include "OS.h"
+#include "PacketPool.h"
+#include "Mutex.h"
+#include "Memory.h"
+
+PacketPool::PacketPool(UInt32 thePacketArraySize, BufferPool* inBufferPool)
+:   fPacketArraySize(thePacketArraySize),
+    fPacketSize(0),
+    fLastPacketTime(0),
+    fTotalPacketsNum(0),
+    fDiscardPacketsNum(0),
+    fBufferPool(inBufferPool)
+{
+    MutexLocker theLocker(&fMutex);
+
+    fPacketSize = fBufferPool->GetBufSize();
+    fPacketArray = new PacketEntry [sizeof(PacketEntry) * thePacketArraySize];
+}
+
+PacketPool::~PacketPool()
+{
+    MutexLocker theLocker(&fMutex);
+
+    for (UInt32 x = 0; x < fPacketArraySize; x++)
+    {
+        if (fPacketArray[x].fPacketSize == 0)
+            continue;
+
+        fBufferPool->Put(fPacketArray[x].fPacketData);
+    }
+
+    delete [] fPacketArray;
+}
+
+int PacketPool::AddPacket(void* inData, UInt32 inLength)
+{
+    MutexLocker theLocker(&fMutex);
+
+    if (inLength > fPacketSize)
+    {
+        fDiscardPacketsNum++;
+        return inLength - fPacketSize;
+    }
+
+    PacketEntry* theEntry = GetEmptyPacket();
+    if (theEntry == NULL)
+   	{
+	    theEntry = this->GetPacket();
+	    if (theEntry == NULL) 
+	    {
+	        fDiscardPacketsNum++;
+	        return -1;
+	    }
+	}
+
+    memcpy(theEntry->fPacketData, inData, inLength);
+    theEntry->fPacketLen    = inLength;
+    theEntry->fPacketSize   = fPacketSize;
+    theEntry->fPos          = 0;
+    theEntry->fAddedTime    = 0; //OS::Milliseconds();
+
+    fPacketsQueue.EnQueue(&theEntry->fElem);
+
+    return 0;
+}
+
+PacketEntry* PacketPool::GetPacket()
+{
+    MutexLocker theLocker(&fMutex);
+
+    if (fPacketsQueue.GetLength() <= 0)
+        return NULL;
+
+    return (PacketEntry*)fPacketsQueue.DeQueue()->GetEnclosingObject();
+}
+
+PacketEntry* PacketPool::GetEmptyPacket()
+{
+    MutexLocker theLocker(&fMutex);
+
+    for (UInt32 x = 0; x < fPacketArraySize; x++)
+    {
+        if (fPacketArray[x].fPacketSize == 0)
+        {
+            fPacketArray[x].fPacketData = fBufferPool->Get();
+            return &fPacketArray[x];
+        }
+    }
+
+    return NULL;
+}
+
+void PacketPool::RemovePacket(PacketEntry* theEntry)
+{
+    MutexLocker theLocker(&fMutex);
+
+    Assert(theEntry != NULL);
+    fBufferPool->Put(theEntry->fPacketData);
+    
+    theEntry->fPacketLen    = 0;
+    theEntry->fPacketSize   = 0;
+    theEntry->fPos          = 0;
+    theEntry->fAddedTime    = 0;
+}
+

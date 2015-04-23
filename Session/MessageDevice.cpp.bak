@@ -1,0 +1,42 @@
+#include "MessageDevice.h"
+#include "AServer.h"
+
+MessageDevice::MessageDevice(char* theDeviceID, NetStream* theStream) 
+ :	fNetStream(theStream)
+{ 
+    strncpy(fDeviceID, theDeviceID, kDeviceIDSize);
+	fDeviceIDStr.Set(fDeviceID);
+	fRef.Set(fDeviceIDStr, this);
+};
+
+SInt64 MessageDevice::ProcessPacket()
+{
+	while (fNetStream->IsLiveSession())
+	{
+		switch(fState)
+		{
+			case kEnroll:
+			{
+				
+			}
+			case kProcessPacket:
+			{
+
+			}
+		}
+	}
+
+	return 0;
+}
+
+int Enroll()
+{
+	return 0;
+}
+
+void Unenroll()
+{
+
+}
+
+

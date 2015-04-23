@@ -1,0 +1,18 @@
+#include "DeviceClient.h"
+#include "AServer.h"
+
+Client::Client() 
+{ 
+    
+};
+
+Client::~Client()
+{
+
+};
+
+SInt64 Client::Process()
+{
+
+}
+

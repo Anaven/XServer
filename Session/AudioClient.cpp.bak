@@ -1,0 +1,554 @@
+#include "VideoClient.h"
+#include "MessageClient.h"
+#include "VideoDevice.h"
+#include "AServer.h"
+
+
+VideoClient::VideoClient(char* theAuthName, char* theDeviceID, NetStream* theStream)
+ : 	Client(AServer::GetVideoClientRefTable(), AServer::GetVideoDeviceRefTable()),
+ 	fObserverNum(0),
+ 	fAllowObserve(true),
+ 	fStartStream(false),
+ 	fVideoFormate(0),
+ 	fUserName(NULL),
+   	fNetStream(theStream),
+   	fFLVHeader(NULL),
+	fFLVHeaderLen(0),
+	fFLVHeaderForFlash(NULL),
+	fFLVHeaderForFlashLen(0)
+{ 
+	strncpy(fAuthName, theAuthName, kAuthNameSize);
+
+	fUserName = &fAuthName[8];
+	fUserNameStr.Set(fUserName);
+	fAuthRef.Set(fUserNameStr, this);
+
+    strncpy(fDeviceID, theDeviceID, kDeviceIDSize);
+	fDeviceIDStr.Set(fDeviceID);
+	fRef.Set(fDeviceIDStr, this);
+
+	fFLVHeader = NEW char[fNetStream->GetPacketSize()];
+	fFLVHeaderForFlash = NEW char[fNetStream->GetPacketSize()];
+
+	fServer->IncreaseNumVideoSession();
+};
+
+VideoClient::~VideoClient() 
+{ 
+	fServer->DecreaseNumVideoSession();  
+
+	delete [] fFLVHeader;
+	delete [] fFLVHeaderForFlash;
+};
+
+
+
+void VideoClient::Broadcast(char* theData, UInt32 theDataLen) 
+{
+	MutexLocker theLocker(fObserverRefTable.GetMutex());
+
+
+	if (!fAllowObserve)
+		return ;
+
+	UInt32 theClientsNum = fObserverRefTable.GetNumRefsInTable();
+	if (theClientsNum == 0)
+		return ;
+
+	RefHashTable* theHashTable = fObserverRefTable.GetHashTable();
+	for (RefHashTableIter theIter(theHashTable); !theIter.IsDone(); theIter.Next())
+    {
+		if (theIter.GetCurrent() == NULL)
+		{
+			fServer->WriteLog("VideoClient[%p]: User '%s' Broadcast Has Some Errors.", this, fUserName);
+			continue;
+		}
+
+    	Client *theClient = (Client*)theIter.GetCurrent()->GetObject();
+        theClient->SendPacket(theData, theDataLen);
+    }
+}
+
+
+int VideoClient::ProcessPacket(char* thePacket, UInt32 thePacketLen)
+{
+	if (thePacket[kVideoPacketHeaderSize] == (char)kHeartWork)
+	{
+		printf("VideoClient[%p]: '%s' kHeartWork\n", this, fUserName);
+	}
+
+
+	Ref *theRef = fDeviceRefTable->Resolve(&fDeviceIDStr);
+	if ((theRef == NULL) || (fAuthority != kUser))
+		return 0;
+
+	// relay to device
+	RefReleaser theReleaser(fDeviceRefTable, theRef);
+	Client* theClient = (Client*)theRef->GetObject();
+	return theClient->SendPacket(thePacket, thePacketLen);
+}
+
+
+int VideoClient::SendPacket(char* inData, UInt32 inLength)
+{
+	if (fVideoFormate == kFLV)
+	{
+		if ((inData[kVideoPacketHeaderSize] == (char)kVideoDev2Da) 
+			&& inData[kVideoPacketHeaderSize + 17] == (char)0x09)
+		{
+			this->SaveFLVHeader(inData, inLength);
+			fStartStream = true;
+		}
+			
+		if (!fStartStream)
+		{
+			printf("VideoClient[%p]: '%s' Stream FLV Not Start.\n", this, fUserName);
+			return 0;
+		}
+
+		printf("VideoClient[%p]: SendPacket FLV %u\n", this, inLength);
+		return fNetStream->SendPacket(inData, inLength);
+	}
+	else if (fVideoFormate == kH264)
+	{
+		printf("VideoClient[%p]: SendPacket H264 %u\n", this, inLength);
+		return fNetStream->SendPacket(inData, inLength);
+	}
+
+	return 0;
+}
+
+
+void VideoClient::InitStream()
+{
+	MutexLocker theLocker(&fMutex);
+	
+	if (fAuthority == kUser)
+	{
+		printf("VideoClient[%p]: User '%s' InitStream H264.\n", this, fUserName);
+		this->ChangeVideoFormate(kH264);
+	}
+	else if (fAuthority == kObserver)
+	{
+		Ref* theClientRef = fClientRefTable->Resolve(&fDeviceIDStr);
+		if (theClientRef == NULL)
+			return ;
+
+
+		RefReleaser theReleaser(fClientRefTable, theClientRef);
+		VideoClient* theUser = (VideoClient*)theClientRef->GetObject();
+		fVideoFormate = theUser->GetVideoFormate();
+		if (fVideoFormate == kFLV)
+		{
+			Mutex* theMutex = theUser->GetMutex();
+			MutexLocker theLocker(theMutex);
+		
+			char* theFLVHeader = theUser->GetFLVHeader();
+			UInt32 theFLVHeaderLen = theUser->GetFLVHeaderLen();
+			this->SendPacket(theFLVHeader, theFLVHeaderLen);
+			printf("VideoClient[%p]: Observer '%s' InitStream FLV, HeaderLen %u.\n", this, fUserName, theFLVHeaderLen);
+		}
+		else if (fVideoFormate == kH264)
+		{
+			printf("VideoClient[%p]: Observer '%s' InitStream H264.\n", this, fUserName);
+		}
+	}
+}
+
+
+void VideoClient::SaveFLVHeader(char* inData, UInt32 inLength)
+{
+	MutexLocker theLocker(&fMutex);
+
+	Assert(inData != NULL);
+	Assert(inLength <= fNetStream->GetPacketSize());
+
+
+	char* theFLVPacket = &inData[43];
+	if (theFLVPacket[0] != 'F' || theFLVPacket[1] != 'L' || theFLVPacket[2] != 'V')
+		return ;
+	
+	printf("VideoDevice[%p]: '%s' Save FLV Header..........\n", this, fDeviceID);
+	memcpy(fFLVHeader, inData, inLength);
+	fFLVHeaderLen = inLength;
+
+	UInt32 headerLen = 0;
+	char dataLen[4];
+	
+	char* scriptTag = theFLVPacket + 13;
+	memset(dataLen, 0, 4); memcpy(&dataLen[1], &scriptTag[1], 3);
+
+	UInt32 scriptTagSize = 11 + ntohl(*(UInt32*)dataLen) + 4;
+	headerLen += 13 + scriptTagSize;
+
+	char* seqHeaderTag = theFLVPacket + headerLen;
+	memset(dataLen, 0, 4); memcpy(&dataLen[1], &seqHeaderTag[1], 3);
+
+	UInt32 seqHeaderTagSize = 11 + ntohl(*(UInt32*)dataLen) + 4;
+	headerLen += seqHeaderTagSize;
+
+	memcpy(fFLVHeaderForFlash, theFLVPacket, headerLen);
+	fFLVHeaderForFlashLen = headerLen;
+}
+
+
+int VideoClient::Enroll()
+{
+	if (fAuthority == kUser)
+	{
+		// find device
+		Ref* theDeviceRef = fDeviceRefTable->Resolve(&fDeviceIDStr);
+		if (theDeviceRef == NULL)
+		{
+			this->SendSessionNotFound();
+	    	return -1;
+		}
+		fDeviceRefTable->Release(theDeviceRef);
+
+		// find user
+		Ref* theUserRef = fClientRefTable->Resolve(&fDeviceIDStr);
+		if (theUserRef != NULL)
+		{
+			// has user
+			RefReleaser theRefReleaser(fClientRefTable, theUserRef);
+			VideoClient* theUser = (VideoClient*)theUserRef->GetObject();   
+
+			
+			if (strcmp(fUserName, theUser->GetUserName()) == 0)
+				theUser->Kill("User", kSelf);
+			else
+				theUser->Kill("User", kOther);
+
+			fClientRefTable->Swap(&fRef);
+		}
+		else
+		{
+			// no user
+			int err = fClientRefTable->Register(&fRef);
+			Assert(err == 0);
+		}
+
+		this->LuanchExpireTime(fExpireTimeInMilSec);
+		this->InitStream();
+		return 0;
+	}
+	else if (fAuthority == kObserver)
+	{
+		// find user
+		Ref* theUserRef = fClientRefTable->Resolve(&fDeviceIDStr);
+		if (theUserRef == NULL)
+		{
+			this->SendSessionNotFound();
+	    	return -1;
+		}
+
+
+		RefReleaser theReleaser(fClientRefTable, theUserRef);	
+		VideoClient* theUser = (VideoClient*)theUserRef->GetObject();
+		
+		if (theUser->IsAllowObserve())
+		{
+			int theMaxObserverNum = fServer->GetMaxOberver();
+			int theObserverNum = theUser->GetObserverNum();
+
+			
+			if (theObserverNum >= theMaxObserverNum)
+			{
+				this->SendObserverSaturated();
+				return -1;
+			}
+
+			this->InitStream();
+			theUser->AddObserver(this);
+			return 0;
+		}
+
+		this->SendObserverSaturated();
+		return -1;
+	}
+	else
+	{
+		this->SendAuthorityError();
+		return -1;
+	}
+
+	return 0;
+}
+
+void VideoClient::Unenroll()
+{
+	if (fAuthority == kUser)
+	{
+		if (!this->HasUser(this))
+			return ;
+
+
+		fServer->WriteLog("VideoClient[%p]: User '%s' @ '%s' Unenroll.", 
+						this, fUserName, fDeviceID);
+		this->KillAllClients(kNone);
+		fClientRefTable->UnRegister(&fRef);
+	}
+	else if (fAuthority == kObserver)
+	{
+		// find user
+		Ref* theUserRef = fClientRefTable->Resolve(&fDeviceIDStr);
+		if (theUserRef == NULL)
+			return ;
+		
+
+		RefReleaser theReleaser(fClientRefTable, theUserRef);
+		VideoClient* theUser = (VideoClient*)theUserRef->GetObject();
+
+		// find observer
+		if (!theUser->HasObserver(this))
+			return ;
+
+		fServer->WriteLog("VideoClient[%p]: Observer '%s' @ '%s' Unenroll.", 
+									this, fUserName, fDeviceID);
+		theUser->RemoveObserver(this);
+	}
+	else 
+	{
+		fServer->WriteLog("VideoClient[%p]: '%s' @ '%s' :: %d Not Enroll, Call Unenroll.", 
+									this, fUserName, fDeviceID, fAuthority);
+	}
+}
+
+
+bool VideoClient::HasUser(VideoClient* theClient)
+{
+	Ref* theUserRef = fClientRefTable->Resolve(&fDeviceIDStr);
+	if (theUserRef == NULL)
+		return false;
+
+
+	RefReleaser theReleaser(fClientRefTable, theUserRef);
+	if (this != (VideoClient*)theUserRef->GetObject())
+		return false;
+
+	return true;
+}
+
+
+int VideoClient::BeginAuthorization()
+{
+	RefTable* theMessageClientRefTable = AServer::GetMessageClientRefTable();
+
+	Ref* theMessageUserRef = theMessageClientRefTable->Resolve(&fDeviceIDStr);
+	if (theMessageUserRef != NULL)
+	{
+		// has user
+		RefReleaser theRefReleaser(theMessageClientRefTable, theMessageUserRef);
+		MessageClient* theMessageUser = (MessageClient*)theMessageUserRef->GetObject();	
+	
+		if (strcmp(fUserName, theMessageUser->GetUserName()) == 0)
+		{
+			int theAuthority = theMessageUser->GetAuthority();
+			SInt64 theExpireTimeInMilSec = theMessageUser->GetExpireTimeInMilSec();
+			bool theAllowObserve = theMessageUser->IsAllowObserve();
+			
+			this->SetAuthority(theAuthority, theExpireTimeInMilSec);
+			this->SetAllowObserve(theAllowObserve);
+		}
+		else
+		{
+			RefTable* theMessageObserverRefTable = theMessageUser->GetObserverRefTable();
+			Ref* theMessageObserverRef = theMessageObserverRefTable->Resolve(fAuthRef.GetString());
+			if (theMessageObserverRef == NULL)
+				return -1;
+		
+			RefReleaser theRefReleaser(theMessageObserverRefTable, theMessageObserverRef);
+			MessageClient* theMessageObserver = (MessageClient*)theMessageObserverRef->GetObject();
+			
+			int theAuthority = theMessageObserver->GetAuthority();
+			SInt64 theExpireTimeInMilSec = theMessageObserver->GetExpireTimeInMilSec();
+			bool theAllowObserve = theMessageUser->IsAllowObserve();
+			
+			this->SetAuthority(theAuthority, theExpireTimeInMilSec);
+			this->SetAllowObserve(theAllowObserve);
+		}
+	}
+	else
+	{
+		// no message user
+		return -1;
+	}
+
+	return 0;
+}
+
+
+void VideoClient::EndAuthorization()
+{
+
+}
+
+
+void VideoClient::ChangeVideoFormate(int theFormate)
+{
+	Ref *theRef = fDeviceRefTable->Resolve(&fDeviceIDStr);
+	if ((theRef == NULL) || (fAuthority != kUser))
+		return ;
+
+	fServer->WriteLog("VideoClient[%p]: User '%s' @ '%s' Change Video Formate %d.", 
+									this, fUserName, fDeviceID, theFormate);
+	// relay to device
+	RefReleaser theReleaser(fDeviceRefTable, theRef);
+	VideoDevice* theDevice = (VideoDevice*)theRef->GetObject();
+	theDevice->ChangeVideoFormate(theFormate);
+
+	MutexLocker theLocker(&fMutex);
+	fVideoFormate = theFormate;
+}
+
+
+void VideoClient::Kill(char* theID, int theCode)
+{
+	MutexLocker theLock(&fMutex);
+
+
+	if (theCode == kSelf)
+	{
+		fServer->WriteLog("VideoClient[%p]: %s '%s' Killed By Self.", this, theID, fUserName);
+		fNetStream->SelfConflict();
+	}
+	else if (theCode == kOther)
+	{
+		fServer->WriteLog("VideoClient[%p]: %s %d '%s' Killed By Others.", this, theID, fUserName);
+		fNetStream->OtherConflict();
+	}
+	else if (theCode == kNoWatch)
+	{
+		fServer->WriteLog("VideoClient[%p]: %s '%s' Disallow Watch.", this, theID, fUserName);
+		fNetStream->ObserverSaturated();
+	}
+	else
+	{
+		fServer->WriteLog("VideoClient[%p]: %s '%s' Exit Normal.", this, theID, fUserName);
+		fNetStream->ExitNormal();
+	}
+
+	fExitState = theCode;
+	fNetStream->StopAcceptSendPacket();
+	fNetStream->Signal(Task::kKillEvent);
+}
+	
+	
+bool VideoClient::HasObserver(VideoClient* theClient)
+{
+	MutexLocker theLocker(&fMutex);
+	
+	Ref* theObserverRef = &theClient->fAuthRef;
+	Ref* theRef = fObserverRefTable.Resolve(theObserverRef->GetString());
+	if (theRef == NULL)
+		return false;
+
+	RefReleaser theReleaser(&fObserverRefTable, theRef);
+	if (theClient != (VideoClient*)theRef->GetObject())
+		return false;
+	
+	return true;
+}
+
+
+void VideoClient::AddObserver(VideoClient* theClient)
+{
+	MutexLocker theLock(&fMutex);
+
+	Ref* theObserverRef = &theClient->fAuthRef;
+	Ref* theOldRef = fObserverRefTable.Resolve(theObserverRef->GetString());
+	if (theOldRef == NULL)
+	{
+		fObserverRefTable.Register(theObserverRef);
+		fObserverNum++;
+	}
+	else
+	{
+		VideoClient* theOldClient = (VideoClient*)theOldRef->GetObject();
+		theOldClient->Kill("Observer", kSelf);
+		fObserverRefTable.Swap(theObserverRef);
+		fObserverRefTable.Release(theOldRef);
+	}
+}
+
+
+void VideoClient::RemoveObserver(VideoClient* theClient)
+{
+	MutexLocker theLock(&fMutex);
+
+	Ref* theObserverRef = &theClient->fAuthRef;
+	fObserverRefTable.UnRegister(theObserverRef);
+	fObserverNum--;
+}
+
+
+void VideoClient::SetAllowObserve(bool canObserve)
+{
+	if (fAuthority != kUser)
+		return ;
+	
+	MutexLocker theLocker(&fMutex);
+	fAllowObserve = canObserve;
+}
+
+
+void VideoClient::LuanchExpireTime(SInt64 theTimeInMilSec)
+{
+	fNetStream->LuanchExpireTime(theTimeInMilSec);
+}
+
+
+void VideoClient::KillAllClients(int theCode)
+{
+	MutexLocker theLocker(fObserverRefTable.GetMutex());
+
+
+	UInt32 theClientsNum = fObserverRefTable.GetNumRefsInTable();
+	fServer->WriteLog("VideoClient[%p]: User '%s' Killall %u Clients.", this, fUserName, theClientsNum);
+	
+	if (theClientsNum == 0)
+		return ;
+
+	RefHashTable* theHashTable = fObserverRefTable.GetHashTable();
+	for (RefHashTableIter theIter(theHashTable); !theIter.IsDone(); theIter.Next())
+    {
+		if (theIter.GetCurrent() == NULL)
+		{
+			fServer->WriteLog("VideoClient[%p]: User '%s' Killall Has Some Errors.", this, fUserName);
+			continue;
+		}
+		
+    	Client *theClient = (Client*)theIter.GetCurrent()->GetObject();
+        theClient->Kill("Observer", theCode);
+    }
+}
+
+
+void VideoClient::SendSessionNotFound()
+{
+	fServer->WriteLog("VideoClient[%p]: '%s' Session Not Found.", this, fUserName);
+	fNetStream->SessionNotFound();
+}
+
+
+void VideoClient::SendAuthorityError()
+{
+	fServer->WriteLog("VideoClient[%p]: '%s' Autority Error.", this, fUserName);
+	fNetStream->AuthorityError();
+}
+
+
+void VideoClient::SendObserverSaturated()
+{
+	fServer->WriteLog("VideoClient[%p]: Observer '%s' Saturated.", this, fUserName);
+	fNetStream->ObserverSaturated();
+}
+
+  
+void VideoClient::Cleanup()
+{
+	this->EndAuthorization();
+	this->Unenroll();
+}
+
+

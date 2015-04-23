@@ -1,0 +1,16 @@
+echo "buildit clean"
+
+echo "rm .o(s)"
+rm -rf ./*.o
+rm -rf ./*/*.o
+rm -rf ./*/*/*.o
+rm -rf ./*/*/*/*.o
+rm -rf ./*/*/*/*/*.o
+rm -rf ./QTFileLib/*.xo
+rm -rf ./SafeStdLib/*.xo
+echo "rm .a(s)"
+rm -rf ./*.a
+rm -rf ./*/*.a
+rm -rf ./*/*/*.a
+rm -rf ./*/*/*/*.a
+rm -rf ./*/*/*/*/*.a

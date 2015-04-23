@@ -1,0 +1,109 @@
+#include "VideoAdaptClient.h"
+#include "MessageClient.h"
+#include "VideoDevice.h"
+#include "AServer.h"
+
+
+VideoAdaptClient::VideoAdaptClient(char* theAuthName, char* theDeviceID, NetStream* theStream)
+ : 	VideoClient(theAuthName, theDeviceID, theStream)
+{ 
+};
+
+
+int VideoAdaptClient::SendPacket(char* inData, UInt32 inLength)
+{
+	/*
+	char* data = (char*)&inData[43];
+	if (inData[43] == 'F' && inData[44] == 'L' && inData[45] == 'V')
+	{
+		data = &data[13];
+
+		char temp[4];
+		memset(temp, 0, 4);
+		memcpy(&temp[1], &data[1], 3);
+		
+		UInt32 datasize = ntohl(*(UInt32*)temp);
+		UInt32 totalsize = ntohl(*(UInt32*)(data + (11 + datasize))) + 4;
+		printf("meta...type: %d, tagtype: %d, datasize = %u, codec: %d, avctype: %d, totalsize: %u\n", 
+			data[0], datasize, (data[11] & 0xf0) >> 4, (data[11] & 0x0f), data[12], totalsize);
+
+		data = &data[datasize + 15];
+
+		memset(temp, 0, 4);
+		memcpy(&temp[1], &data[1], 3);
+
+		datasize = ntohl(*(UInt32*)temp);
+		totalsize = ntohl(*(UInt32*)(data + (11 + datasize)))+ 4;
+		printf("seq...type: %d, tagtype: %d, datasize = %u, codec: %d, avctype: %d, totalsize: %u\n", 
+			data[0], datasize, (data[11] & 0xf0) >> 4, (data[11] & 0x0f), data[12], totalsize);
+
+		data = &data[datasize + 15];
+
+		fStartStream = true;
+	}
+
+	char temp[4] = { 0, 0, 0, 0};
+	memcpy(&temp[1], &data[1], 3);
+		
+	UInt32 datasize = ntohl(*(UInt32*)temp);
+	UInt32 totalsize = ntohl(*(UInt32*)(data + (11 + datasize))) + 4;
+	printf("type: %d, datasize: %d, frametype = %u, codec: %d, avctype: %d, totalsize: %u, writelen = %u\n", 
+		data[0], datasize, (data[11] & 0xf0) >> 4, (data[11] & 0x0f), data[12], totalsize, inLength - 43);
+	*/
+	//if ((!fStartStream) && (inData[43] == 'F') && (inData[44] = 'L') && (inData[45] == 'V'))
+	//	fStartStream = true;
+	MutexLocker theLocker(&fMutex);
+
+
+	if ((inData[kVideoPacketHeaderSize] == (char)kVideoDev2Da) 
+		&& inData[kVideoPacketHeaderSize + 17] == (char)0x09)
+	{
+		this->SaveFLVHeader(inData, inLength);
+		fStartStream = true;
+	}
+		
+	if (!fStartStream)
+	{
+		printf("VideoAdaptClient[%p]: '%s' Stream Not Start.\n", this, fUserName);
+		return 0;
+	}
+
+	printf("VideoAdaptClient[%p]: SendPacket %u\n", this, inLength);
+	return fNetStream->SendPacket(&inData[43], inLength - 43);
+}
+
+
+void VideoAdaptClient::InitStream()
+{
+	if (fAuthority == kUser)
+	{
+		printf("VideoAdaptClient[%p]: User '%s' InitStream H264.\n", this, fUserName);
+		this->ChangeVideoFormate(kFLV);
+	}
+	else if (fAuthority == kObserver)
+	{
+		Ref* theClientRef = fClientRefTable->Resolve(&fDeviceIDStr);
+		if (theClientRef == NULL)
+			return ;
+
+
+		RefReleaser theReleaser(fClientRefTable, theClientRef);
+		VideoClient* theUser = (VideoClient*)theClientRef->GetObject();
+		fVideoFormate = theUser->GetVideoFormate();
+		if (fVideoFormate == kFLV)
+		{
+			Mutex* theMutex = theUser->GetMutex();
+			MutexLocker theLocker(theMutex);
+		
+			char* theFLVHeader = theUser->GetFLVHeader();
+			UInt32 theFLVHeaderLen = theUser->GetFLVHeaderLen();
+			this->SendPacket(theFLVHeader, theFLVHeaderLen);
+			printf("VideoClient[%p]: Observer '%s' InitStream FLV, HeaderLen %u.\n", this, fUserName, theFLVHeaderLen);
+		}
+		else if (fVideoFormate == kH264)
+		{
+			printf("VideoClient[%p]: Observer '%s' InitStream H264.\n", this, fUserName);
+		}
+	}
+}
+

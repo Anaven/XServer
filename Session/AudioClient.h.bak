@@ -1,0 +1,94 @@
+#ifndef __AUDIO_CLIENT__
+#define __AUDIO_CLIENT__
+
+#include "StrPtrLen.h"
+#include "Client.h"
+#include "NetStream.h"
+
+
+#define AUDIO_CLIENT_DEBUG 1
+
+class VideoClient : public Client
+{
+	public:
+
+    	VideoClient(char* theAuthName, char* theDeviceID, NetStream* theStream);
+        ~VideoClient();
+
+		int		Enroll();
+		void	Unenroll();
+		
+		int		ProcessPacket(char* thePacket, UInt32 thePacketLen);
+		void 	Kill(char* theID, int theCode);
+		virtual int SendPacket(char* inData, UInt32 inLength);
+
+		int 	BeginAuthorization();
+		void 	EndAuthorization();
+		
+		bool 	HasAuthorizor(VideoClient* theClient);
+		bool 	HasUser(VideoClient* theClient);
+
+		char* GetUserName() { MutexLocker theLocker(&fMutex); return fUserName; };
+		StrPtrLen* GetUserNameStr() { MutexLocker theLocker(&fMutex); return &fUserNameStr; };
+
+		void 	AddObserver(VideoClient* theClient);
+		void 	RemoveObserver(VideoClient* theClient);
+		bool	HasObserver(VideoClient* theClient);
+
+		bool	IsAllowObserve() { MutexLocker theLocker(&fMutex); return fAllowObserve; };
+		void 	SetAllowObserve(bool canObserve);
+
+		int		GetObserverNum() { MutexLocker theLocker(&fMutex); return fObserverNum; };
+    	void 	LuanchExpireTime(SInt64 theTimeInMilSec);
+
+		void 	Broadcast(char* theData, UInt32 theDataLen);
+		void	KillAllClients(int theCode);
+
+		virtual void InitStream();
+
+		void 	ChangeVideoFormate(int theFormate);
+		int		GetVideoFormate() { MutexLocker theLocker(&fMutex); return fVideoFormate; };
+
+		char*	GetFLVHeader() 		{ return fFLVHeader; };
+		UInt32  GetFLVHeaderLen() 	{ return fFLVHeaderLen; };
+		
+		char*	GetFLVHeaderForFLash() 		{ return fFLVHeaderForFlash; };
+		UInt32  GetFLVHeaderForFlashLen() 	{ return fFLVHeaderForFlashLen; };
+		
+		void	Cleanup();
+
+	protected:
+
+		void 	SendSessionNotFound();
+		void 	SendAuthorityError();
+		void 	SendObserverSaturated();
+
+		void 	SaveFLVHeader(char* inData, UInt32 inLength);
+
+		int		fObserverNum;
+		bool	fAllowObserve;
+		bool	fStartStream;
+
+		int		fVideoFormate;
+		
+		char*		fUserName;
+		StrPtrLen 	fUserNameStr;
+			
+        char fAuthName[kAuthNameSize];
+		char fDeviceID[kDeviceIDSize];
+		StrPtrLen fDeviceIDStr;
+		
+		NetStream* 	fNetStream;
+		
+		char* 		fFLVHeader;
+		UInt32 		fFLVHeaderLen;
+		
+		char* 		fFLVHeaderForFlash;
+		UInt32 		fFLVHeaderForFlashLen;
+
+		Ref			fAuthRef;
+		RefTable 	fObserverRefTable;
+};
+
+#endif
+

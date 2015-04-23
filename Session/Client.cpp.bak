@@ -1,0 +1,19 @@
+#include "Client.h"
+#include "AServer.h"
+
+RefTable Client::sDeviceRefTable;
+
+Client::Client() 
+{ 
+    
+};
+
+Client::~Client()
+{
+
+};
+
+SInt64 Client::Process()
+{
+
+}

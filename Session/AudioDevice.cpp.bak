@@ -1,0 +1,165 @@
+#include "VideoDevice.h"
+#include "MessageClient.h"
+#include "AServer.h"
+#include "EnrollReportSession.h"
+
+
+VideoDevice::VideoDevice(char* theDeviceID, NetStream* theStream)
+ : 	Client(AServer::GetVideoClientRefTable(), AServer::GetVideoDeviceRefTable()),
+ 	fNetStream(theStream),
+ 	fKeepAliveTask(theStream)
+{ 
+	fKeepAliveTask.SetTimeout(fServer->GetKeepAliveInMilSec());
+	
+    strncpy(fDeviceID, theDeviceID, kDeviceIDSize);
+	fDeviceIDStr.Set(fDeviceID);
+	fRef.Set(fDeviceIDStr, this);
+
+	fServer->IncreaseNumVideoSession();
+};
+
+
+VideoDevice::~VideoDevice()
+{ 
+	fServer->DecreaseNumVideoSession(); 
+};
+
+
+int VideoDevice::ProcessPacket(char* thePacket, UInt32 thePacketLen)
+{
+	if (thePacket[kVideoPacketHeaderSize] == (char)kHeartWork)
+	{
+		printf("VideoDevice[%p]: '%s' kHeartWork\n", this, fDeviceID);
+		fKeepAliveTask.RefreshTimeout();
+		return 0;
+	}
+
+	/*
+	if ((thePacket[kVideoPacketHeaderSize] == (char)kVideoDev2Da) 
+		&& thePacket[kVideoPacketHeaderSize + 17] == (char)0x09)
+	{
+		this->SaveFLVHeader(thePacket, thePacketLen);
+	}
+	*/
+
+	Ref *theRef = fClientRefTable->Resolve(&fDeviceIDStr);
+	if (theRef == NULL)
+		return 0;
+
+
+	RefReleaser theReleaser(fClientRefTable, theRef);
+	Client* theClient = (Client*)theRef->GetObject();
+
+	theClient->Broadcast(thePacket, thePacketLen);
+	return theClient->SendPacket(thePacket, thePacketLen);;
+}
+
+
+int VideoDevice::Enroll()
+{
+	Ref *theRef = fDeviceRefTable->Resolve(&fDeviceIDStr);
+
+
+	fServer->WriteLog("VideoDevice[%p]: '%s' Enroll.", this, fDeviceID);
+	fNetStream->UserEnroll();
+	
+	if (theRef == NULL)
+    {
+    	fDeviceRefTable->Register(&fRef);
+    	return 0;
+    }
+
+	RefReleaser theRefReleaser(fDeviceRefTable, theRef);
+	VideoDevice* theDevice = (VideoDevice*)theRef->GetObject();
+
+	
+	theDevice->Kill("Device", kSelf);
+	fDeviceRefTable->Swap(&fRef);
+
+	return 0;
+}
+
+
+void VideoDevice::Unenroll()
+{
+	fServer->WriteLog("VideoDevice[%p]: '%s' Unenroll", this, fDeviceID);
+	fDeviceRefTable->UnRegister(&fRef);
+}
+
+bool VideoDevice::HasClient()
+{
+	Ref* theUserRef = fClientRefTable->Resolve(&fDeviceIDStr);
+	if (theUserRef == NULL)
+		return false;
+
+	fClientRefTable->Release(theUserRef);
+	return true;
+}
+
+
+int VideoDevice::SendPacket(char* inData, UInt32 inLength)
+{
+	return fNetStream->SendPacket(inData, inLength);
+}
+
+
+void VideoDevice::ChangeVideoFormate(int theFormate)
+{
+	char data[7];
+	data[0] = kVideo;
+	data[1] = 0x00;
+	data[2] = 0x00;
+	data[3] = 0x00;
+	data[4] = 0x02;
+	data[5] = kChangeVideoFormate;   
+	data[6] = theFormate;  
+
+	this->SendPacket(data, 7);
+}
+
+void VideoDevice::Kill(char* theID, int theCode)
+{
+	MutexLocker theLocker(&fMutex);
+
+
+	if (theCode == kSelf)
+	{
+		fServer->WriteLog("VideoDevice[%p]: %s '%s' Self Conflict.", this, theID, fDeviceID);
+		fNetStream->SelfConflict();
+	}
+	else if (theCode == kOther)
+	{
+		fServer->WriteLog("VideoDevice[%p]: %s '%s' Other Conflict.", this, theID, fDeviceID);
+		fNetStream->OtherConflict();
+	}
+	else
+	{
+		fServer->WriteLog("VideoDevice[%p]: %s '%s' Exit Normal.", this, theID, fDeviceID);
+		fNetStream->ExitNormal();
+	}
+
+	fNetStream->StopAcceptSendPacket();
+	fNetStream->Signal(Task::kKillEvent);
+}
+
+
+void VideoDevice::KillClient()
+{
+	Ref* theClientRef = fClientRefTable->Resolve(&fDeviceIDStr);
+
+	
+	if (theClientRef == NULL)
+		return ;
+	
+	RefReleaser theReleaser(fClientRefTable, theClientRef); 
+	MessageClient* theUserClientSession = (MessageClient*)theClientRef->GetObject();
+	theUserClientSession->Kill("User", kNone);
+}
+
+
+void VideoDevice::Cleanup()
+{
+	this->KillClient();
+	this->Unenroll();
+}
+

@@ -1,0 +1,18 @@
+#ifndef __DEVICE_CLIENT__
+#define __DEVICE_CLIENT__
+
+#include "Ref.h"
+#include "Mutex.h"
+
+#define DEVICE_CLIENT_DEBUG 1
+
+class DeviceClient : public Task
+{
+	public:
+
+    	DeviceClient();
+        ~DeviceClient();
+};
+
+#endif
+

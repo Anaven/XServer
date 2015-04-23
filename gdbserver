@@ -1,0 +1,6 @@
+if [ -e ./AccessServer ] ; then
+   gdb ./XServer -x gdb_script
+else
+   echo "Build not found!"
+   exit 1
+fi

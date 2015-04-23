@@ -1,0 +1,920 @@
+#include "MessageSessionInterface.h"
+#include "EnrollReportSession.h"
+
+RefTable MessageSessionInterface::sDeviceRefTable;
+
+MessageSessionInterface::MessageSessionInterface() 
+ : 	Session(sMessageIdleIntervalInMilSec),
+    fLastObserverNum(1),
+	fIsAuthorized(false),
+	fIsUserLogin(false),
+	fIsObserverLogin(false),
+	fBufSize(sMaxMessagePackets * sMessagePacketSize),
+	fRecvBuffer(NULL),
+	fRecvBufferLen(0),
+	fPacketEntry(NULL),
+	fPacketPool(NULL)
+{ 
+	this->SetTaskName("message");
+	fKeepAliveTask.SetTimeout(sKeepAliveInMilSec);
+
+	AServer::GetServer()->IncreaseNumMessageSessionInterface();
+
+	fPacketPool = new PacketPool(sMaxMessagePackets, sMessagePacketSize);	
+	fRecvBuffer = new char [fBufSize];
+};
+
+MessageSessionInterface::~MessageSessionInterface() 
+{
+	AServer::GetServer()->DecreaseNumMessageSessionInterface();
+
+	delete fPacketPool;
+	delete [] fRecvBuffer;
+};
+
+SInt64 MessageSessionInterface::Run()
+{
+	EventFlags theEvents = this->GetEvents();
+
+	if (theEvents & Task::kKillEvent)
+    	this->NotifyBeKilled();
+
+	if (theEvents & Task::kTimeoutEvent)
+    	this->NotifyTimeout(); 
+
+    if (theEvents & Task::kExpireEvent) 
+        this->NotifyExpire(); 
+
+	if (theEvents & Task::kReadEvent)
+    {
+    	int err = 0;
+        
+    	while (err != EAGAIN)
+        {
+        	if (fRecvBufferLen == fBufSize)
+            {
+            	this->Signal(Task::kReadEvent);
+            	break;
+            }
+            
+        	UInt32 theLen = 0;
+        	err = fSocket.Read(&fRecvBuffer[fRecvBufferLen], fBufSize - fRecvBufferLen, &theLen);
+        	fRecvBufferLen += theLen;     
+
+        	if (err != 0 && err != EAGAIN)
+            {
+            	this->WriteLog("MessageSessionInterface[%p]: Read Socket Closed Error %d.", this, err);
+				fState = kCleanup;
+				break;
+            }
+        }
+    }
+
+	return this->DoTranscation();
+}
+
+void MessageSessionInterface::NotifyBeKilled()
+{
+	if (fSessionType == kDevice)
+    {
+    	if (fConflictState == kSelf)
+        	this->WriteLog("MessageSessionInterface[%p]: Device '%s' Conflict By Self.", this, fDeviceID);
+    	else if (fConflictState == kOther)
+        	this->WriteLog("MessageSessionInterface[%p]: Device '%s' Conflict By Other.", this, fDeviceID);
+    	else
+        	this->WriteLog("MessageSessionInterface[%p]: Device '%s' Be Killed.", this, fDeviceID);
+    }
+	else if (fSessionType == kClient)
+    {
+    	if (fConflictState == kSelf)
+        	this->WriteLog("MessageSessionInterface[%p]: Client '%s' @ '%s' Conflict By Self.", this, fUserName, fDeviceID);
+    	else if (fConflictState == kOther)
+        	this->WriteLog("MessageSessionInterface[%p]: Client '%s' @ '%s' Conflict By Other.", this, fUserName, fDeviceID);
+    	else
+        	this->WriteLog("MessageSessionInterface[%p]: Client '%s' @ '%s' Be Killed.", this, fUserName, fDeviceID);
+    }
+	else
+    	this->WriteLog("MessageSessionInterface[%p]: Be Killed.", this);
+
+	if (fConflictState == kSelf)
+    	this->SetMessage(Packet::kRegisterReply, Packet::kSelfConflict);
+	else if (fConflictState == kOther)
+    	this->SetMessage(Packet::kRegisterReply, Packet::kOtherConflict);
+	else
+    	this->SetMessage(Packet::kRegisterReply, Packet::kExitNormal);    
+    
+	this->TearDown();
+}
+
+void MessageSessionInterface::NotifyTimeout()
+{
+	if (fSessionType == kDevice)
+    	this->WriteLog("MessageSessionInterface[%p]: Device '%s' Time Out.", this, fDeviceID);
+	else if (fSessionType == kClient)
+    	this->WriteLog("MessageSessionInterface[%p]: Client '%s' @ '%s' Time Out.", this, fUserName, fDeviceID);
+
+	this->SetMessage(Packet::kRegisterReply, Packet::kTimeout);
+	this->TearDown();
+}
+
+void MessageSessionInterface::NotifyExpire()
+{
+	if (fSessionType == kDevice)
+    	this->WriteLog("MessageSessionInterface[%p]: Device '%s' Expire.", this, fDeviceID);
+	else if (fSessionType == kClient)
+    	this->WriteLog("MessageSessionInterface[%p]: Client '%s' @ '%s' Expire.", this, fUserName, fDeviceID);
+
+	this->SetMessage(Packet::kRegisterReply, Packet::kExpire);
+	this->TearDown();
+}
+
+void MessageSessionInterface::RelayToUser(char* inData, UInt32 inLength)
+{
+	if (fUserName[0] == 0)
+		return ;
+
+	fUserNameStr.Set(fUserName, strlen(fUserName));
+	Ref* theRef = fClientRefTable.Resolve(&fUserNameStr);
+	if (theRef == NULL)
+		return ;
+
+	MessageSessionInterface* theUserSession = (MessageSessionInterface *)theRef->GetObject();
+	int err = theUserSession->AddPacket(inData, inLength);
+	
+#ifdef MESSAGE_SESSION_INTERFACE_DEBUG
+	if (err == -1) 
+		printf("MessageSessionInterface[%p]: '%s' Relay To '%s' User Failed.", this, fDeviceID, fUserName);
+	else if (err > 0)
+		printf("MessageSessionInterface[%p]: '%s' Relay To '%s' Out %u Bytes of Range %u.\n", this, fDeviceID, fUserName, err, fPacketPool->GetPacketSize());
+#endif
+
+	fClientRefTable.Release(theRef); 
+}
+
+void MessageSessionInterface::BroadcastToClients(char *inData, UInt32 inLength)
+{
+	MutexLocker theClientLocker(fClientRefTable.GetMutex());
+    
+	RefHashTable* theHashTable = fClientRefTable.GetHashTable();
+	for (RefHashTableIter theIter(theHashTable); !theIter.IsDone(); theIter.Next())
+    {
+    	MessageSessionInterface *theClientSession = (MessageSessionInterface*)theIter.GetCurrent()->GetObject();
+    	int err = theClientSession->AddPacket(inData, inLength);
+        
+#ifdef MESSAGE_SESSION_INTERFACE_DEBUG
+        if (err == -1) 
+            printf("MessageSessionInterface[%p]: Device '%s' BroadcastToClients Failed.", this, fDeviceID);
+        else if (err > 0)
+            printf("MessageSessionInterface[%p]: Device '%s' BroadcastToClients Out %u Bytes of Range %u.\n", this, fDeviceID, err, fPacketPool->GetPacketSize());
+#endif
+    }
+}
+
+void MessageSessionInterface::RelayToDevice(char *inData, UInt32 inLength)
+{
+	Ref* theRef = sDeviceRefTable.Resolve(&fDeviceIDStr);
+	if (theRef == NULL)
+    	return ;
+
+	MessageSessionInterface* theDeviceSession = (MessageSessionInterface *)theRef->GetObject();
+	int err = theDeviceSession->AddPacket(inData, inLength);
+    
+#ifdef MESSAGE_SESSION_INTERFACE_DEBUG
+    if (err == -1) 
+        printf("MessageSessionInterface[%p]: Client '%s' @ '%s' RelayToDevice Failed.", this, fUserName, fDeviceID);
+    else if (err > 0)
+        printf("MessageSessionInterface[%p]: Client '%s' @ '%s' RelayToDevice Out %u Bytes of Range %u.\n", this, fUserName, fDeviceID, err, fPacketPool->GetPacketSize());
+#endif
+
+    sDeviceRefTable.Release(theRef); 
+}
+
+int MessageSessionInterface::AddPacket(char* inData, UInt32 inLength) 
+{ 
+    return fPacketPool->AddPacket(inData, inLength); 
+}
+
+SInt64 MessageSessionInterface::DoTranscation() 
+{
+	while (this->IsLiveSession())
+    {
+    	switch (fState)
+        {    
+        	case kSetup:
+            {
+            	char *theMessagePacket = fRecvBuffer;
+            	if (fRecvBufferLen < Packet::kMessagePacketHeaderSize)
+                {
+                	fState = kSetup;
+                	return fIdleTimeInMilSec;
+                }
+                
+            	if (theMessagePacket[0] != (char)Packet::kMessage)
+                {
+                	fState = RespondUnknownError();
+                	break;
+                }
+
+                fPacketDataLen = ntohs(*(UInt16*)(theMessagePacket + 1));
+            	if (fRecvBufferLen < Packet::kMessagePacketHeaderSize + fPacketDataLen)
+                {
+                	fState = kSetup;
+                	return fIdleTimeInMilSec;
+                }
+
+            	if (theMessagePacket[3] == (char)Packet::kDevRegisterRequest)
+                {
+                    this->SetDeviceID(&theMessagePacket[4], kDeviceIDLen);
+                    this->RefDeviceID();
+
+					this->EnrollDevice();
+
+					fSessionType = kDevice;
+					fState = RespondDeviceRegisterSuccess();
+            	}
+            	else if (theMessagePacket[3] == (char)Packet::kDaRegisterRequest)
+                {   
+                    this->SetAuthName(&theMessagePacket[4], kAuthNameLen);
+					this->RefAuthName();
+					this->SetUserName(&theMessagePacket[12], kUserNameLen);
+					this->RefUserName();
+					this->SetDeviceID(&theMessagePacket[20], kDeviceIDLen);
+
+					fSessionType = kClient;
+					fState = kAuthorizeClient;
+            	}
+				else
+                {
+                	fSessionType = kUnknown;
+                	fState = RespondUnknownError();
+                }
+
+				break;
+        	}
+			case kAuthorizeClient:
+			{
+				Ref* theDeviceRef = sDeviceRefTable.Resolve(&fDeviceIDStr); // resolve device
+				if (theDeviceRef == NULL)
+				{
+					fState = RespondSessionNotFound();
+					break;
+				}
+				sDeviceRefTable.Release(theDeviceRef);
+
+				int err = this->BeginAuthorization();
+				if (err != 0)
+				{
+					fState = RespondInternalError();
+					break;
+				}
+
+				fState = kAuthorizing;
+				break;
+			}
+			case kAuthorizing:
+			{
+				if (!this->IsAuthorized())
+				{
+					fState = kAuthorizing;
+					return fIdleTimeInMilSec;
+				}
+				
+				this->EndAuthorization();
+
+				this->WriteLog("MessageSessionInterface[%p]: Client '%s' Authority %d, ExperiationTime %lld ms.", 
+					this, fUserName, fAuthority, fExperiationTimeInMilSec);
+
+				int err = this->EnrollClient();
+				if (err == kUser)
+				{
+	            	fState = RespondUserRegisterSuccess();
+					this->NotifyDoesAllowToBeWatched();
+				}
+				else if (err == kObserver)
+	            	fState = RespondObserverRegisterSuccess();
+	        	else if (err == kSessionNotFound)
+	            	fState = RespondSessionNotFound();
+	        	else if (err == kObserverSaturation)
+	            	fState = RespondObserverSaturation();
+	            else if (err == kAuthorityError)
+	            	fState = RespondAuthorityError();
+				
+				break;
+			}
+        	case kSuccess:
+            {            
+            	UInt32 thePacketLen = Packet::kMessagePacketHeaderSize + fPacketDataLen;
+            	fRecvBufferLen -= thePacketLen;
+            	if (fRecvBufferLen > 0)
+                    ::memmove(fRecvBuffer, &fRecvBuffer[thePacketLen], fRecvBufferLen);
+
+            	fState = kRelayData;
+            	break;
+            }
+        	case kFailed:
+            {
+            	this->TearDown();
+            	break;
+            }    
+            case kRelayData:
+            {
+                fState = kSendingData;
+                if (fRecvBufferLen <= 0)
+                    break;
+                                    
+                UInt32 theLen = fRecvBufferLen;
+                UInt32 thePacketLen = 0;
+                char *theMessagePacket = NULL;
+
+                for(UInt32 i = 0; (i < theLen) && fRecvBufferLen;)
+                {
+                    theMessagePacket = fRecvBuffer + i;
+                    if (theMessagePacket[0] != (char)Packet::kMessage)
+                    {
+                        fRecvBufferLen--;
+                        i++;
+                        continue;
+                    }
+
+                    if (fRecvBufferLen < Packet::kMessagePacketHeaderSize + Packet::kMessagePacketCtrlSize)
+                    {
+                        if (i != 0) ::memmove(fRecvBuffer, theMessagePacket, fRecvBufferLen);
+                        break;
+                    }
+
+                    if ((theMessagePacket[3] != (char)Packet::kComDev2Da)
+                     && (theMessagePacket[3] != (char)Packet::kComDa2Dev)
+                     && (theMessagePacket[3] != (char)Packet::kHeartWork)
+                     && (theMessagePacket[3] != (char)Packet::kDownloadApp)
+                     && (theMessagePacket[3] != (char)Packet::kDownloadReply)
+                     && (theMessagePacket[3] != (char)Packet::kDeviceState)
+                     && (theMessagePacket[3] != (char)Packet::kDeviceLog)
+                     && (theMessagePacket[3] != (char)Packet::kInput)
+                     && (theMessagePacket[3] != (char)Packet::kAllowObserve)
+                     && (theMessagePacket[3] != (char)Packet::kCleanAllApp)
+                     && (theMessagePacket[3] != (char)Packet::kInstallApp)
+                     && (theMessagePacket[3] != (char)Packet::kInstallAppReply)
+                     && (theMessagePacket[3] != (char)Packet::kRunApp)
+                     && (theMessagePacket[3] != (char)Packet::kRunAppReply)
+                     && (theMessagePacket[3] != (char)Packet::kUninstallApp)
+                     && (theMessagePacket[3] != (char)Packet::kUninstallAppReply)
+                     && (theMessagePacket[3] != (char)Packet::kCleanAllAppReply))
+                    {
+                        fRecvBufferLen--;
+                        i++;
+                        continue;
+                    }
+
+                    fPacketDataLen = ntohs(*(UInt16*)(theMessagePacket + 1));
+                    if (fRecvBufferLen < (Packet::kMessagePacketHeaderSize + fPacketDataLen))
+                    {
+                        if (i != 0) ::memmove(fRecvBuffer, theMessagePacket, fRecvBufferLen);
+                        break;
+                    }
+
+                    thePacketLen = Packet::kMessagePacketHeaderSize + fPacketDataLen;
+                    if ((theMessagePacket[3] == (char)Packet::kDownloadReply) 
+					 || (theMessagePacket[3] == (char)Packet::kComDev2Da)
+					 || (theMessagePacket[3] == (char)Packet::kDeviceState)
+					 || (theMessagePacket[3] == (char)Packet::kDeviceLog)
+					 || (theMessagePacket[3] == (char)Packet::kInstallAppReply)
+					 || (theMessagePacket[3] == (char)Packet::kRunAppReply)
+					 || (theMessagePacket[3] == (char)Packet::kUninstallAppReply)
+					 || (theMessagePacket[3] == (char)Packet::kCleanAllAppReply))
+                    {
+                        Assert(fSessionType == kDevice);
+                        this->RelayToUser(theMessagePacket, thePacketLen);
+                    }
+                    else if ((theMessagePacket[3] == (char)Packet::kComDa2Dev)
+                          || (theMessagePacket[3] == (char)Packet::kDownloadApp)
+                          || (theMessagePacket[3] == (char)Packet::kInput)
+                          || (theMessagePacket[3] == (char)Packet::kCleanAllApp)
+                          || (theMessagePacket[3] == (char)Packet::kInstallApp)
+                          || (theMessagePacket[3] == (char)Packet::kRunApp)
+                          || (theMessagePacket[3] == (char)Packet::kUninstallApp))
+                    {
+                        Assert(fSessionType == kClient);
+                        if (fAuthority == kUser)
+                            this->RelayToDevice(theMessagePacket, thePacketLen);
+                    }
+                    else if (theMessagePacket[3] == (char)Packet::kHeartWork)  
+                    {
+                        if ((fSessionType == kClient) && (fAuthority == kUser))
+                            this->HaveObserver();
+
+                        fKeepAliveTask.RefreshTimeout();
+                    }
+					else if (theMessagePacket[3] == (char)Packet::kAllowObserve)
+					{
+                        if ((fSessionType == kClient) && (fAuthority == kUser))
+                        {
+                        	this->DisallowToBeWatched(theMessagePacket[4]);
+														
+							if (theMessagePacket[4] == (char)0x00)
+							{
+								this->WriteLog("MessageSessionInterface[%p]: User '%s' @ Device '%s' Allow To Be Watched", this, fUserName, fDeviceID);
+								this->SetMessage(Packet::kAllowObserveStateReply, Packet::kAllowToBeWatched);
+							}
+							else if (theMessagePacket[4] == (char)0x01)
+							{
+								this->WriteLog("MessageSessionInterface[%p]: User '%s' @ Device '%s' Disallow To Be Watched", this, fUserName, fDeviceID);
+								this->SetMessage(Packet::kAllowObserveStateReply, Packet::kDisallowToBeWathed);
+							}
+                        }
+					}
+            
+                    i += thePacketLen;
+                    fRecvBufferLen -= thePacketLen;
+                    thePacketLen = 0;     
+                }
+                
+                break;
+            }
+            case kSendingData:
+            {  
+                fState = kRelayData;
+                for(;;)
+                {
+                    if (fPacketEntry == NULL)
+                    {
+                        fPacketEntry = fPacketPool->GetPacket();
+                        if (fPacketEntry == NULL) break;
+                    }
+                    
+                    int err = 0;
+                    UInt32 theLen = 0;
+                    char* theData = (char*)fPacketEntry->fPacketData + fPacketEntry->fPos;
+                    UInt32 theLeft = fPacketEntry->fPacketLen - fPacketEntry->fPos;
+                        
+                    err = fSocket.Send(theData, theLeft, &theLen);
+                    fPacketEntry->fPos += theLen;
+
+                    if ((err != 0) && (err == EAGAIN))
+                        break;
+                    
+                    if (err != 0 && err != EAGAIN)
+                    {
+                    	this->WriteLog("Message[%p]: Send Socket Closed Error %d.", this, err);
+                        fState = kCleanup;
+                        break;
+                    }
+
+                    if (fPacketEntry->fPos == fPacketEntry->fPacketLen)
+                    {
+                        fPacketPool->RemovePacket(fPacketEntry);
+                        fPacketEntry = NULL;
+                    }
+                }
+
+            	if (fIsTearDown)
+                {
+                	fState = fPacketPool->IsEmpty() ? kCleanup : kSendingData;
+                	break;
+                }
+
+            	return fIdleTimeInMilSec;
+            }
+            case kCleanup:
+            {    
+                this->Cleanup();
+                return -1;
+            }
+        }
+    }
+
+	this->Cleanup();
+	return -1;
+}
+
+int MessageSessionInterface::EnrollDevice()
+{
+	this->NotifyWebDeviceLogin();
+
+	Ref *theRef = sDeviceRefTable.Resolve(&fDeviceIDStr);
+	if (theRef == NULL)
+    {
+    	sDeviceRefTable.Register(&fRef);
+    	return 0;
+    } 
+    
+	RefReleaser theRefReleaser(&sDeviceRefTable, theRef);
+	MessageSessionInterface* theSession = (MessageSessionInterface*)theRef->GetObject();
+    
+	theSession->Signal(Task::kKillEvent);
+    theSession->SetConflictState(kSelf);
+     
+	sDeviceRefTable.Swap(&fRef);
+	return 0;
+}
+
+void MessageSessionInterface::UnenrollDevice()
+{
+	this->WriteLog("MessageSessionInterface[%p]: Device '%s' UnRegister", this, fDeviceID);
+	this->KillAllClients();
+	this->NotifyWebDeviceLogout();
+
+	sDeviceRefTable.UnRegister(&fRef);
+}
+
+int MessageSessionInterface::EnrollClient()
+{
+	Ref* theDeviceRef = sDeviceRefTable.Resolve(&fDeviceIDStr); // resolve device
+	if (theDeviceRef == NULL)
+    	return kSessionNotFound;
+
+	RefReleaser theRefReleaser(&sDeviceRefTable, theDeviceRef);
+    MessageSessionInterface* theDeviceSession = (MessageSessionInterface*)theDeviceRef->GetObject();    
+
+    if (fAuthority == kObserver)
+    {        
+    	if ((theDeviceSession->GetObserverNum() > sMaxObserver) || theDeviceSession->DoesDisallowToBeWatched())
+        	return kObserverSaturation;
+
+    	theDeviceSession->IncreaseObserverNum();
+    }
+    else if (fAuthority == kUser)
+    {
+    	if (theDeviceSession->IsOccupied() && !theDeviceSession->IsLastUser(fUserName, kUserNameLen))
+        {
+            char* theKickUserName = theDeviceSession->GetUserName();
+            StrPtrLen theKickUserNameStr(theKickUserName, kUserNameLen);
+
+            Ref *theKickClientRef = theDeviceSession->fClientRefTable.Resolve(&theKickUserNameStr);
+            if (theKickClientRef != NULL)
+            {
+                MessageSessionInterface* theSession = (MessageSessionInterface*)theKickClientRef->GetObject();
+            	theSession->Signal(Task::kKillEvent);
+            	theSession->SetConflictState(kOther);
+
+                theDeviceSession->fClientRefTable.Release(theKickClientRef);
+            }
+        }
+
+        theDeviceSession->BeOccupied(fUserName, kUserNameLen, this);
+        this->LuanchExperiationTime(fExperiationTimeInMilSec);
+    }
+	else
+    	return kAuthorityError;
+
+	Ref* theDupClientRef = theDeviceSession->fClientRefTable.Resolve(&fUserNameStr);
+	if (theDupClientRef == NULL)
+    {   
+    	theDeviceSession->fClientRefTable.Register(&fRef);
+        if (fAuthority == kUser)
+        {
+    	    this->NotifyWebUserLogin();
+        }
+        else if (fAuthority == kObserver)
+        {
+            this->NotifyWebObserverLogin();
+        }
+    }
+    else
+    {
+    	MessageSessionInterface* theSession = (MessageSessionInterface*)theDupClientRef->GetObject();
+    	theSession->Signal(Task::kKillEvent);
+        theSession->SetConflictState(kSelf);
+        
+    	theDeviceSession->fClientRefTable.Swap(&fRef);
+    	theDeviceSession->fClientRefTable.Release(theDupClientRef);
+    }        
+
+	fIsRegisterSuccess = true;
+
+	return fAuthority;
+}
+
+void MessageSessionInterface::UnenrollClient()
+{
+	if (!fIsRegisterSuccess)
+    	return ;
+
+	Ref* theDeviceRef = sDeviceRefTable.Resolve(&fDeviceIDStr);
+	if (theDeviceRef == NULL)
+    	return ;
+
+	RefReleaser theRefReleaser(&sDeviceRefTable, theDeviceRef);
+	MessageSessionInterface* theDeviceSession = (MessageSessionInterface*)theDeviceRef->GetObject();
+
+	if (fAuthority == kObserver)
+    {
+    	this->WriteLog("MessageSessionInterface[%p]: Observer '%s' @ Device '%s' UnRegister", this, fUserName, fDeviceID);
+        theDeviceSession->DecreaseObserverNum();
+
+        if (fConflictState != kSelf)
+        {
+            this->NotifyWebObserverLogout();
+        }
+    }
+	else if (fAuthority == kUser)
+    {
+    	this->WriteLog("MessageSessionInterface[%p]: User '%s' @ Device '%s' UnRegister", this, fUserName, fDeviceID);
+        if (fConflictState != kSelf)
+        {
+            this->NotifyWebUserLogout();
+        }
+
+        theDeviceSession->ReleaseOccupied(this);
+		theDeviceSession->SetDoesDisallowToBeWatched(0);
+    }
+     
+	theDeviceSession->fClientRefTable.UnRegister(&fRef);
+}
+
+int MessageSessionInterface::BeginAuthorization()
+{
+	RefTable *theClientAuthRefTable = AServer::GetClientAuthRefTable();
+	
+	int err = theClientAuthRefTable->Register(&fAuthRef);
+	if (err != 0) 
+	{
+		printf("MessageSessionInterface[%p]: Auth '%s' Is Authorizing Now\n", this, fAuthName);
+		return -1;
+	}
+
+	fIsAuthBegined = true;
+
+	ClientAuthorizeSession* theSession = NEW ClientAuthorizeSession;
+	theSession->SetURL(fAuthName, fDeviceID, sWebIP, sWebPort);
+	theSession->Signal(Task::kStartEvent);
+
+	return 0;
+}
+
+
+void MessageSessionInterface::EndAuthorization()
+{
+	if (!fIsAuthBegined)
+		return ;
+
+	RefTable *theClientAuthRefTable = AServer::GetClientAuthRefTable();
+	
+	theClientAuthRefTable->UnRegister(&fAuthRef);
+}
+
+
+void MessageSessionInterface::NotifyWebDeviceLogin()
+{
+    EnrollReportSession *theStateSession = NEW EnrollReportSession;
+    theStateSession->SetURL(sServerID, NULL, fDeviceID, kDeviceLogin, sWebIP, sWebPort);
+    theStateSession->Signal(Task::kStartEvent);
+}
+
+void MessageSessionInterface::NotifyWebDeviceLogout()
+{
+    EnrollReportSession *theStateSession = NEW EnrollReportSession;
+    theStateSession->SetURL(NULL, NULL, fDeviceID, kDeviceLogout, sWebIP, sWebPort);
+    theStateSession->Signal(Task::kStartEvent);
+}
+
+void MessageSessionInterface::NotifyWebUserLogin()
+{
+	if (fAuthority != kUser)
+    	return ;
+
+    EnrollReportSession *theStateSession = NEW EnrollReportSession;
+    theStateSession->SetURL(sServerID, fAuthName, fDeviceID, kUserLogin, sWebIP, sWebPort);
+    theStateSession->Signal(Task::kStartEvent);
+
+	fIsUserLogin = true;
+}
+
+void MessageSessionInterface::NotifyWebUserLogout()
+{
+	if ((fAuthority != kUser) || (!fIsUserLogin))
+    	return ;
+
+    EnrollReportSession *theStateSession = NEW EnrollReportSession;
+    theStateSession->SetURL(sServerID, fAuthName, fDeviceID, kUserLogout, sWebIP, sWebPort);
+    theStateSession->Signal(Task::kStartEvent);
+
+	fIsUserLogin = false;
+}
+
+void MessageSessionInterface::NotifyWebObserverLogin()
+{
+	if (fAuthority != kObserver)
+    	return ;
+
+    EnrollReportSession *theStateSession = NEW EnrollReportSession;
+    theStateSession->SetURL(sServerID, fAuthName, fDeviceID, kObserverLogin, sWebIP, sWebPort);
+    theStateSession->Signal(Task::kStartEvent);
+
+	fIsObserverLogin = true;
+}
+
+void MessageSessionInterface::NotifyWebObserverLogout()
+{
+	if ((fAuthority != kObserver) || (!fIsObserverLogin))
+    	return ;
+
+    EnrollReportSession *theStateSession = NEW EnrollReportSession;
+    theStateSession->SetURL(sServerID, fAuthName, fDeviceID, kObserverLogout, sWebIP, sWebPort);
+    theStateSession->Signal(Task::kStartEvent);
+
+	fIsObserverLogin = false;
+}
+
+bool MessageSessionInterface::IsAuthorized()
+{
+	MutexLocker theLocker(&fSessionMutex);
+	
+	return fIsAuthorized;
+}
+
+void MessageSessionInterface::SetAuthority(int theAuthority, SInt64 theExperiationTime)
+{
+	MutexLocker theLocker(&fSessionMutex);
+
+	fIsAuthorized = true;
+
+	fAuthority = theAuthority;
+	fExperiationTimeInMilSec = theExperiationTime;
+}
+
+void MessageSessionInterface::KillAllClients()
+{
+	MutexLocker theClientLocker(fClientRefTable.GetMutex());
+
+	RefHashTable* theHashTable = fClientRefTable.GetHashTable();
+	for (RefHashTableIter theIter(theHashTable); !theIter.IsDone(); theIter.Next())
+    {
+    	MessageSessionInterface *theClientSession = (MessageSessionInterface*)theIter.GetCurrent()->GetObject();
+        theClientSession->SetConflictState(kNone);
+    	theClientSession->Signal(Task::kKillEvent);
+    }
+}
+
+void MessageSessionInterface::SetMessage(int theCmd, int theCode)
+{
+    fTempPacketData[0] = Packet::kMessage;
+    fTempPacketData[1] = 0x00;
+    fTempPacketData[2] = 0x02;
+    fTempPacketData[3] = theCmd;
+	fTempPacketData[4] = theCode;
+    fTempPacketDataLen = 5;
+    
+    this->AddPacket(fTempPacketData, fTempPacketDataLen);
+    fTempPacketDataLen = 0;
+}
+
+void MessageSessionInterface::HaveObserver()
+{
+	Ref* theDeviceRef = sDeviceRefTable.Resolve(&fDeviceIDStr);
+	if (theDeviceRef == NULL)
+    	return ;
+
+	RefReleaser theRefReleaser(&sDeviceRefTable, theDeviceRef);
+	MessageSessionInterface* theDeviceSession = (MessageSessionInterface*)theDeviceRef->GetObject();    
+    
+    int clientNum = theDeviceSession->fClientRefTable.GetNumRefsInTable();
+    if (fLastObserverNum == clientNum)
+        return ;
+
+    if (clientNum == 1)
+        this->NotifyUserNotBeWatched();
+    else
+        this->NotifyUserBeWatched();
+
+    fLastObserverNum = theDeviceSession->fClientRefTable.GetNumRefsInTable();
+}
+
+void MessageSessionInterface::DisallowToBeWatched(int disallowOrNot)
+{
+	Ref* theDeviceRef = sDeviceRefTable.Resolve(&fDeviceIDStr); // resolve device
+	if (theDeviceRef == NULL)
+    	return;
+
+    MessageSessionInterface* theDeviceSession = (MessageSessionInterface*)theDeviceRef->GetObject();  
+	theDeviceSession->SetDoesDisallowToBeWatched(disallowOrNot);
+
+	MutexLocker theClientLocker(theDeviceSession->fClientRefTable.GetMutex());
+	
+	RefHashTable* theHashTable = theDeviceSession->fClientRefTable.GetHashTable();
+	for (RefHashTableIter theIter(theHashTable); !theIter.IsDone(); theIter.Next())
+	{
+		MessageSessionInterface *theClientSession = (MessageSessionInterface*)theIter.GetCurrent()->GetObject();
+		if (memcmp(fUserName, theClientSession->GetUserName(), kUserNameLen) == 0)
+			continue;
+		
+		if (disallowOrNot) theClientSession->Signal(Task::kKillEvent);
+	}
+
+	sDeviceRefTable.Release(theDeviceRef);
+}
+
+void MessageSessionInterface::NotifyUserBeWatched()
+{
+    this->SetMessage(Packet::kRegisterReply, Packet::kBeWatched);
+}
+
+void MessageSessionInterface::NotifyUserNotBeWatched()
+{
+    this->SetMessage(Packet::kRegisterReply, Packet::kNotBeWatched);
+}
+
+int MessageSessionInterface::RespondInternalError()
+{
+    this->WriteLog("MessageSessionInterface[%p]: Client '%s' Access Server Internal Error", this, fUserName);
+	this->SetMessage(Packet::kRegisterReply, Packet::kInternalError);
+
+	return kFailed;
+}
+
+int MessageSessionInterface::RespondAuthorizeFailed()
+{
+	this->WriteLog("MessageSessionInterface[%p]: Client '%s' Verify Failed", this, fUserName);
+	this->SetMessage(Packet::kRegisterReply, Packet::kAuthorizeFailed);
+    
+	return kFailed;
+}
+
+int MessageSessionInterface::RespondDeviceRegisterSuccess()
+{
+    this->WriteLog("MessageSessionInterface[%p]: Device '%s' Register Success", this, fDeviceID);
+	this->SetMessage(Packet::kRegisterReply, Packet::kRegisterSuccess);
+    
+    return kSuccess;
+}
+
+int MessageSessionInterface::RespondUserRegisterSuccess()
+{
+    this->WriteLog("MessageSessionInterface[%p]: User '%s' @ Device '%s' Register Success", this, fUserName, fDeviceID);
+	this->SetMessage(Packet::kRegisterReply, Packet::kRegisterSuccess);
+    
+	return kSuccess;
+}
+
+int MessageSessionInterface::RespondObserverRegisterSuccess()
+{
+    this->WriteLog("MessageSessionInterface[%p]: Observer '%s' @ Device '%s' Register Success", this, fUserName, fDeviceID);
+    this->SetMessage(Packet::kRegisterReply, Packet::kObserverRegisterSuccess);
+
+    return kSuccess;
+}
+
+int MessageSessionInterface::RespondUnknownError()
+{
+    this->WriteLog("MessageSessionInterface[%p]: Unknown Error", this);
+	this->SetMessage(Packet::kRegisterReply, Packet::kUnknownError);
+    
+    return kFailed;
+}
+
+int MessageSessionInterface::RespondSessionNotFound()
+{
+    this->WriteLog("MessageSessionInterface[%p]: Client '%s' @ Device '%s' Session Not Found", this, fUserName, fDeviceID);
+	this->SetMessage(Packet::kRegisterReply, Packet::kSessionNotFound);
+
+    return kFailed;
+}
+
+int MessageSessionInterface::RespondObserverSaturation()
+{
+    this->WriteLog("MessageSessionInterface[%p]: Client '%s' @ Device '%s' Observer Saturation", this, fUserName, fDeviceID);
+	this->SetMessage(Packet::kRegisterReply, Packet::kObserverSaturation);
+
+    return kFailed;
+}
+
+int MessageSessionInterface::RespondAuthorityError()
+{
+    this->WriteLog("MessageSessionInterface[%p]: Client '%s' @ Device '%s' Authority Error", this, fUserName, fDeviceID);
+	this->SetMessage(Packet::kRegisterReply, Packet::kAuthorityError);
+    
+    return kFailed;
+}
+
+void MessageSessionInterface::NotifyDoesAllowToBeWatched()
+{
+	Ref* theDeviceRef = sDeviceRefTable.Resolve(&fDeviceIDStr);
+	if (theDeviceRef == NULL)
+    	return ;
+
+	RefReleaser theRefReleaser(&sDeviceRefTable, theDeviceRef);
+	MessageSessionInterface* theDeviceSession = (MessageSessionInterface*)theDeviceRef->GetObject();  
+
+	int doesDisallowToBeWatched =  theDeviceSession->DoesDisallowToBeWatched();
+	if (doesDisallowToBeWatched == 0x00)	
+		this->SetMessage(Packet::kAllowObserveStateReply, Packet::kAllowToBeWatched);
+	else if (doesDisallowToBeWatched == 0x01)
+		this->SetMessage(Packet::kAllowObserveStateReply, Packet::kDisallowToBeWathed);
+}
+
+void MessageSessionInterface::TearDown()
+{
+	fState = kSendingData;
+    fIsTearDown = true;
+}
+
+void MessageSessionInterface::Cleanup()
+{
+	if (fSessionType == kDevice)
+    	this->UnenrollDevice();
+	else if (fSessionType == kClient)
+	{
+		this->EndAuthorization();
+		this->UnenrollClient();
+	}
+}
+

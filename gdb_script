@@ -1,0 +1,7 @@
+set args -d -c ./access_server.conf
+handle SIGPIPE nostop
+
+
+
+
+

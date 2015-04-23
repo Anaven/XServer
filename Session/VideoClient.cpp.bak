@@ -1,0 +1,518 @@
+#include "MessageClient.h"
+#include "AServer.h"
+
+
+MessageClient::MessageClient(char* theAuthName, char* theDeviceID, NetStream* theStream)
+ : 	Client(AServer::GetMessageClientRefTable(), AServer::GetMessageDeviceRefTable()),
+ 	fObserverNum(0),
+ 	fAllowObserve(true),
+ 	fUserName(NULL),
+   	fNetStream(theStream),
+   	fKeepAliveTask(theStream)
+{ 
+	fKeepAliveTask.SetTimeout(fServer->GetKeepAliveInMilSec());
+	strncpy(fAuthName, theAuthName, kAuthNameSize);
+
+	fUserName = &fAuthName[8];
+	fUserNameStr.Set(fUserName);
+	fAuthRef.Set(fUserNameStr, this);
+
+    strncpy(fDeviceID, theDeviceID, kDeviceIDSize);
+	fDeviceIDStr.Set(fDeviceID);
+	fRef.Set(fDeviceIDStr, this);
+
+	fServer->DecreaseNumMessageSession();
+};
+
+
+int MessageClient::ProcessPacket(char* thePacket, UInt32 thePacketLen)
+{
+	if (thePacket[kMessagePacketHeaderSize] == (char)kHeartWork)
+	{
+		printf("MessageClient[%p]: '%s' kHeartWork\n", this, fAuthName);
+		fKeepAliveTask.RefreshTimeout();
+		if (fObserverRefTable.GetNumRefsInTable() > 0)
+			fNetStream->HaveObserver();
+		else
+			fNetStream->HaveNoObserver();
+
+		return 0;
+	}
+	else if (thePacket[kMessagePacketHeaderSize] == (char)kAllowObserveOrNot)
+	{
+		if (thePacket[kMessagePacketHeaderSize + 1] == (char)kAllow)
+		{
+			this->SendAllowObserve();
+		}
+		else if (thePacket[kMessagePacketHeaderSize + 1] == (char)kDisallow)
+		{
+			this->SendDisallowObserve();
+			this->KillAllClients(kNoWatch);
+		}
+		return 0;
+	}
+	
+	fKeepAliveTask.RefreshTimeout();
+
+	Ref *theRef = fDeviceRefTable->Resolve(&fDeviceIDStr);
+	if ((theRef == NULL) || (fAuthority != kUser))
+		return 0;
+
+
+	// relay to device
+	RefReleaser theReleaser(fDeviceRefTable, theRef);
+	Client* theClient = (Client*)theRef->GetObject();
+	return theClient->SendPacket(thePacket, thePacketLen);
+}
+
+
+int MessageClient::SendPacket(char* inData, UInt32 inLength)
+{
+	return fNetStream->SendPacket(inData, inLength);
+}
+
+
+int MessageClient::Enroll()
+{
+	if (fAuthority == kUser)
+	{
+		// find device
+		Ref* theDeviceRef = fDeviceRefTable->Resolve(&fDeviceIDStr);
+		if (theDeviceRef == NULL)
+		{
+			this->SendSessionNotFound();
+	    	return -1;
+		}
+		fDeviceRefTable->Release(theDeviceRef);
+
+		// find user
+		Ref* theUserRef = fClientRefTable->Resolve(&fDeviceIDStr);
+		if (theUserRef != NULL)
+		{
+			// has user
+			RefReleaser theRefReleaser(fClientRefTable, theUserRef);
+			MessageClient* theUser = (MessageClient*)theUserRef->GetObject();   
+
+			
+			if (strcmp(fUserName, theUser->GetUserName()) == 0)
+			{
+				
+				theUser->Kill("User", kSelf);
+			}
+			else
+			{
+				theUser->Kill("User", kOther);
+				this->PostUserEnroll(); 			//++++++++++++++++++++++++++++++++++++/
+			}
+
+			fClientRefTable->Swap(&fRef);
+		}
+		else
+		{
+			// no user
+			int err = fClientRefTable->Register(&fRef);
+			Assert(err == 0);
+			this->PostUserEnroll(); 			//++++++++++++++++++++++++++++++++++++/
+		}
+
+		this->SendUserEnroll();
+		this->LuanchExpireTime(fExpireTimeInMilSec);
+		return 0;
+	}
+	else if (fAuthority == kObserver)
+	{
+		// find user
+		Ref* theUserRef = fClientRefTable->Resolve(&fDeviceIDStr);
+		if (theUserRef == NULL)
+		{
+			this->SendSessionNotFound();
+	    	return -1;
+		}
+
+
+		RefReleaser theReleaser(fClientRefTable, theUserRef);	
+		MessageClient* theUser = (MessageClient*)theUserRef->GetObject();
+		
+		if (theUser->IsAllowObserve())
+		{
+			int theMaxObserverNum = fServer->GetMaxOberver();
+			int theObserverNum = theUser->GetObserverNum();
+
+			
+			if (theObserverNum >= theMaxObserverNum)
+			{
+				this->SendObserverSaturated();
+				return -1;
+			}
+
+			theUser->AddObserver(this);
+			this->SendObserverEnroll();
+			return 0;
+		}
+		else
+		{
+			this->SendObserverSaturated();
+			return -1;
+		}
+	}
+	else
+	{
+		this->SendAuthorityError();
+		return -1;
+	}
+
+	return 0;
+}
+
+void MessageClient::Unenroll()
+{
+	if (fAuthority == kUser)
+	{
+		if (!this->HasUser(this))
+			return ;
+
+
+		fServer->WriteLog("MessageClient[%p]: User '%s' @ '%s' Unenroll.", 
+						this, fUserName, fDeviceID);
+		this->KillAllClients(kNone);
+		fClientRefTable->UnRegister(&fRef);
+		this->PostUserUnenroll();
+	}
+	else if (fAuthority == kObserver)
+	{
+		// find user
+		Ref* theUserRef = fClientRefTable->Resolve(&fDeviceIDStr);
+		if (theUserRef == NULL)
+			return ;
+		
+
+		RefReleaser theReleaser(fClientRefTable, theUserRef);
+		MessageClient* theUser = (MessageClient*)theUserRef->GetObject();
+
+		// find observer
+		if (!theUser->HasObserver(this))
+			return ;
+
+		fServer->WriteLog("MessageClient[%p]: Observer '%s' @ '%s' Unenroll.", 
+									this, fUserName, fDeviceID);
+		theUser->RemoveObserver(this);
+	}
+	else 
+	{
+		fServer->WriteLog("MessageClient[%p]: '%s' @ '%s' :: %d Not Enroll, Call Unenroll.", 
+									this, fUserName, fDeviceID, fAuthority);
+	}
+}
+
+bool MessageClient::HasUser(MessageClient* theClient)
+{
+	Ref* theUserRef = fClientRefTable->Resolve(&fDeviceIDStr);
+	if (theUserRef == NULL)
+		return false;
+
+
+	RefReleaser theReleaser(fClientRefTable, theUserRef);
+	if (this != (MessageClient*)theUserRef->GetObject())
+		return false;
+
+	return true;
+}
+
+int MessageClient::BeginAuthorization()
+{
+	RefTable *theAuthorizeRefTable = AServer::GetAuthorizeRefTable();
+
+	
+	int err = theAuthorizeRefTable->Register(&fAuthRef);
+	if (err != 0) 
+	{
+		fServer->WriteLog("MessageClient[%p]: '%s' Is Authorizing Now.", this, fAuthName);
+		return -1;
+	}
+
+	char* theWebIP = fServer->GetWebIP();
+	UInt16 theWebPort = fServer->GetWebPort();
+
+	fServer->WriteLog("MessageClient[%p]: '%s' Authorize Start.", this, fAuthName);
+	ClientAuthorizeSession* theSession = NEW ClientAuthorizeSession;
+	theSession->ConstructURL(fAuthName, fDeviceID, theWebIP, theWebPort);
+	theSession->Signal(Task::kStartEvent);
+
+	return 0;
+}
+
+
+void MessageClient::EndAuthorization()
+{
+	if (!this->HasAuthorizor(this))
+		return ;
+
+
+	RefTable *theAuthorizeRefTable = AServer::GetAuthorizeRefTable();
+	fServer->WriteLog("MessageClient[%p]: '%s' Authorize End.", this, fAuthName);
+	theAuthorizeRefTable->UnRegister(&fAuthRef);
+}
+
+
+bool MessageClient::HasAuthorizor(MessageClient* theClient)
+{
+	RefTable *theAuthorizeRefTable = AServer::GetAuthorizeRefTable();
+	Ref* theAuthRef = &theClient->fAuthRef;
+
+	
+	Ref* theRef = theAuthorizeRefTable->Resolve(theAuthRef->GetString());
+	if (theRef == NULL)
+		return false;
+
+	RefReleaser theReleaser(theAuthorizeRefTable, theRef);
+	if (theClient != (MessageClient*)theRef->GetObject())
+		return false;
+
+	return true;
+}
+
+
+void MessageClient::Kill(char* theID, int theCode)
+{
+	MutexLocker theLock(&fMutex);
+
+
+	if (theCode == kSelf)
+	{
+		fServer->WriteLog("MessageClient[%p]: %s '%s' Killed By Self.", this, theID, fUserName);
+		fNetStream->SelfConflict();
+	}
+	else if (theCode == kOther)
+	{
+		fServer->WriteLog("MessageClient[%p]: %s %d '%s' Killed By Others.", this, theID, fUserName);
+		fNetStream->OtherConflict();
+	}
+	else if (theCode == kNoWatch)
+	{
+		fServer->WriteLog("MessageClient[%p]: %s '%s' Disallow Watch.", this, theID, fUserName);
+		fNetStream->ObserverSaturated();
+	}
+	else
+	{
+		fServer->WriteLog("MessageClient[%p]: %s '%s' Exit Normal.", this, theID, fUserName);
+		fNetStream->ExitNormal();
+	}
+
+	fExitState = theCode;
+	fNetStream->StopAcceptSendPacket();
+	fNetStream->Signal(Task::kKillEvent);
+}
+
+
+void MessageClient::PostUserEnroll()
+{
+	Assert(fAuthority == kUser);
+	EnrollReportSession* theSession = NEW EnrollReportSession();
+
+	char* theServerID = fServer->GetServerID();
+	char* theWebIP = fServer->GetWebIP();
+	UInt16 theWebPort = fServer->GetWebPort();
+
+	theSession->ConstructURL(theServerID, fAuthName, fDeviceID, kUserLogin, theWebIP, theWebPort);
+    theSession->Signal(Task::kStartEvent);
+}
+
+
+void MessageClient::PostUserUnenroll()
+{
+	Assert(fAuthority == kUser);
+	if (fExitState == kSelf)
+		return ;
+
+	
+	EnrollReportSession* theSession = NEW EnrollReportSession();
+
+	char* theServerID = fServer->GetServerID();
+	char* theWebIP = fServer->GetWebIP();
+	UInt16 theWebPort = fServer->GetWebPort();
+
+	theSession->ConstructURL(theServerID, fAuthName, fDeviceID, kUserLogout, theWebIP, theWebPort);
+    theSession->Signal(Task::kStartEvent);
+}
+	
+
+void MessageClient::PostObserverEnroll()	
+{
+	Assert(fAuthority == kObserver);
+
+
+	EnrollReportSession* theSession = NEW EnrollReportSession();
+
+	char* theServerID = fServer->GetServerID();
+	char* theWebIP = fServer->GetWebIP();
+	UInt16 theWebPort = fServer->GetWebPort();
+
+	theSession->ConstructURL(theServerID, fAuthName, fDeviceID, kObserverLogin, theWebIP, theWebPort);
+    theSession->Signal(Task::kStartEvent);
+}
+
+
+void MessageClient::PostObserverUnenroll()
+{
+	Assert(fAuthority == kObserver);
+	if (fExitState == kSelf)
+		return;
+
+		
+	EnrollReportSession* theSession = NEW EnrollReportSession();
+
+	char* theServerID = fServer->GetServerID();
+	char* theWebIP = fServer->GetWebIP();
+	UInt16 theWebPort = fServer->GetWebPort();
+
+	theSession->ConstructURL(theServerID, fAuthName, fDeviceID, kObserverLogout, theWebIP, theWebPort);
+    theSession->Signal(Task::kStartEvent);
+}
+	
+	
+bool MessageClient::HasObserver(MessageClient* theClient)
+{
+	MutexLocker theLocker(&fMutex);
+	
+	Ref* theObserverRef = &theClient->fAuthRef;
+	Ref* theRef = fObserverRefTable.Resolve(theObserverRef->GetString());
+	if (theRef == NULL)
+		return false;
+
+	RefReleaser theReleaser(&fObserverRefTable, theRef);
+	if (theClient != (MessageClient*)theRef->GetObject())
+		return false;
+	
+	return true;
+}
+
+
+void MessageClient::AddObserver(MessageClient* theClient)
+{
+	MutexLocker theLock(&fMutex);
+
+	Ref* theObserverRef = &theClient->fAuthRef;
+	Ref* theOldRef = fObserverRefTable.Resolve(theObserverRef->GetString());
+	if (theOldRef == NULL)
+	{
+		fObserverRefTable.Register(theObserverRef);
+		fObserverNum++;
+		theClient->PostObserverEnroll(); 				//++++++++++++++++++++++++++++++++++++/
+	}
+	else
+	{
+		MessageClient* theOldClient = (MessageClient*)theOldRef->GetObject();
+		theOldClient->Kill("Observer", kSelf);
+		fObserverRefTable.Swap(theObserverRef);			//------------------------------------/
+		fObserverRefTable.Release(theOldRef);
+	}
+}
+
+
+void MessageClient::RemoveObserver(MessageClient* theClient)
+{
+	MutexLocker theLock(&fMutex);
+
+	Ref* theObserverRef = &theClient->fAuthRef;
+	fObserverRefTable.UnRegister(theObserverRef);
+	fObserverNum--;
+
+	theClient->PostObserverUnenroll(); 					//++++++++++++++++++++++++++++++++++++/
+}
+
+
+void MessageClient::LuanchExpireTime(SInt64 theTimeInMilSec)
+{
+	fNetStream->LuanchExpireTime(theTimeInMilSec);
+}
+
+
+void MessageClient::KillAllClients(int theCode)
+{
+	MutexLocker theLocker(fObserverRefTable.GetMutex());
+
+
+	UInt32 theClientsNum = fObserverRefTable.GetNumRefsInTable();
+	fServer->WriteLog("MessageClient[%p]: User '%s' Killall %u Clients.", this, fUserName, theClientsNum);
+	
+	if (theClientsNum == 0)
+		return ;
+
+	RefHashTable* theHashTable = fObserverRefTable.GetHashTable();
+	for (RefHashTableIter theIter(theHashTable); !theIter.IsDone(); theIter.Next())
+    {
+		if (theIter.GetCurrent() == NULL)
+		{
+			fServer->WriteLog("MessageClient[%p]: User '%s' Killall Has Some Errors.", this, fUserName);
+			continue;
+		}
+		
+    	MessageClient *theClient = (MessageClient*)theIter.GetCurrent()->GetObject();
+        theClient->Kill("Observer", theCode);
+		theClient->PostObserverUnenroll();
+    }
+}
+
+
+void MessageClient::SendSessionNotFound()
+{
+	fServer->WriteLog("MessageClient[%p]: '%s' Session Not Found.", this, fUserName);
+	fNetStream->SessionNotFound();
+}
+
+
+void MessageClient::SendUserEnroll()
+{
+	fServer->WriteLog("MessageClient[%p]: User '%s' Enroll.", this, fUserName);
+	fNetStream->UserEnroll();
+}
+
+
+void MessageClient::SendAuthorityError()
+{
+	fServer->WriteLog("MessageClient[%p]: '%s' Autority Error.", this, fUserName);
+	fNetStream->AuthorityError();
+}
+
+
+void MessageClient::SendObserverEnroll()
+{
+	fServer->WriteLog("MessageClient[%p]: Observer '%s' Enroll.", this, fUserName);
+	fNetStream->ObserverEnroll();
+}
+
+
+void MessageClient::SendObserverSaturated()
+{
+	fServer->WriteLog("MessageClient[%p]: Observer '%s' Saturated.", this, fUserName);
+	fNetStream->ObserverSaturated();
+}
+
+
+void MessageClient::SendAllowObserve()
+{
+	fServer->WriteLog("MessageClient[%p]: User '%s' Allow Observe.", this, fUserName);
+	fNetStream->AllowObserve();
+
+	MutexLocker theLocker(&fMutex);
+	fAllowObserve = true;
+}
+
+
+void MessageClient::SendDisallowObserve()
+{
+	fServer->WriteLog("MessageClient[%p]: User '%s' Disallow Observe.", this, fUserName);
+	fNetStream->DisallowObserve();
+
+	MutexLocker theLocker(&fMutex);
+	fAllowObserve = false;
+}
+
+
+void MessageClient::Cleanup()
+{
+	this->EndAuthorization();
+	this->Unenroll();
+}
+
+

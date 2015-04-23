@@ -1,0 +1,111 @@
+#ifndef __MESSAGE_SESSION_INTERFACE__
+#define __MESSAGE_SESSION_INTERFACE__
+
+#include "Session.h"
+#include "PacketPool.h"
+#include "IntegratedBufferPool.h"
+#include "ClientAuthorizeSession.h"
+
+#define MESSAGE_SESSION_DEBUG 1
+
+class AudioSession;
+class VideoSession;
+
+class MessageSessionInterface : public Session
+{
+	public:
+
+    	static RefTable* GetDeviceRefTable() { return &sDeviceRefTable; };
+
+    	MessageSessionInterface();
+        ~MessageSessionInterface();
+
+    	void 	Cleanup();
+    	SInt64 	Run();
+
+		bool 	IsAuthorized();
+		void    SetAuthority(int theAuthority,SInt64 theExperiationTime);
+
+		int 	AddPacket(char* inData, UInt32 inLength);
+        
+	private:
+
+    	int 	EnrollDevice();
+    	void 	UnenrollDevice();
+
+    	int 	EnrollClient();
+    	void 	UnenrollClient();
+
+		int 	BeginAuthorization();
+		void	EndAuthorization();
+
+    	void 	NotifyWebDeviceLogin();
+    	void 	NotifyWebDeviceLogout();
+
+    	void 	NotifyWebUserLogin();
+    	void 	NotifyWebUserLogout();
+
+    	void 	NotifyWebObserverLogin();
+    	void 	NotifyWebObserverLogout();
+
+        // send data from device to clients
+        void 	RelayToUser(char* inData, UInt32 inLength);
+    	void 	BroadcastToClients(char *inData, UInt32 inLength);
+
+        // send data from user to device
+    	void 	RelayToDevice(char *inData, UInt32 inLength);
+        
+    	SInt64 	DoTranscation(); 
+
+        // the function is designed for device session
+    	void 	KillAllClients();
+
+        // stop receive message 
+    	void 	TearDown();
+        
+    	void 	SetMessage(int theCmd, int theCode);
+
+    	void 	NotifyBeKilled();
+    	void 	NotifyTimeout();
+    	void 	NotifyExpire();
+
+		void	HaveObserver();
+		void	NotifyUserBeWatched();
+		void	NotifyUserNotBeWatched();
+
+		void 	NotifyDoesAllowToBeWatched();
+
+		void 	DisallowToBeWatched(int disallowOrNot);
+
+    	int 	RespondInternalError();
+    	int		RespondAuthorizeFailed();
+        
+    	int 	RespondDeviceRegisterSuccess();
+    	int 	RespondUserRegisterSuccess();
+    	int 	RespondObserverRegisterSuccess();
+
+    	int 	RespondUnknownError();
+    	int 	RespondSessionNotFound();
+    	int 	RespondAuthorityError();
+    	int 	RespondObserverSaturation();        // device only
+
+		int				fLastObserverNum;
+		bool			fIsAuthorized;
+
+    	bool	    	fIsUserLogin;
+		bool			fIsObserverLogin;
+		
+    	UInt32			fBufSize;
+    	char*     		fRecvBuffer;
+    	UInt32			fRecvBufferLen;
+
+		PacketEntry*	fPacketEntry;
+    	PacketPool*		fPacketPool;
+		
+    	static RefTable sDeviceRefTable;
+
+    	friend class AudioSession;
+    	friend class VideoSession;
+};
+
+#endif

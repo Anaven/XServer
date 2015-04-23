@@ -1,0 +1,201 @@
+#include "MessageDevice.h"
+#include "MessageClient.h"
+#include "AServer.h"
+#include "EnrollReportSession.h"
+
+
+MessageDevice::MessageDevice(char* theDeviceID, NetStream* theStream)
+ : 	Client(AServer::GetMessageClientRefTable(), AServer::GetMessageDeviceRefTable()),
+ 	fNetStream(theStream),
+ 	fKeepAliveTask(theStream)
+{ 
+	fKeepAliveTask.SetTimeout(fServer->GetKeepAliveInMilSec());
+	
+    strncpy(fDeviceID, theDeviceID, kDeviceIDSize);
+	fDeviceIDStr.Set(fDeviceID);
+	fRef.Set(fDeviceIDStr, this);
+
+	fServer->DecreaseNumMessageSession();
+};
+
+
+int MessageDevice::ProcessPacket(char* thePacket, UInt32 thePacketLen)
+{
+	if (thePacket[kMessagePacketHeaderSize] == (char)kHeartWork)
+	{
+		printf("MessageDevice[%p]: '%s' kHeartWork\n", this, fDeviceID);
+		fKeepAliveTask.RefreshTimeout();
+		return 0;
+	}
+
+	Ref *theRef = fClientRefTable->Resolve(&fDeviceIDStr);
+	if (theRef == NULL)
+		return 0;
+
+
+	RefReleaser theReleaser(fClientRefTable, theRef);
+	Client* theClient = (Client*)theRef->GetObject();
+	return theClient->SendPacket(thePacket, thePacketLen);
+}
+
+
+int MessageDevice::Enroll()
+{
+	Ref *theRef = fDeviceRefTable->Resolve(&fDeviceIDStr);
+
+
+	fServer->WriteLog("MessageDevice[%p]: '%s' Enroll.", this, fDeviceID);
+	this->PostDeviceEnroll();
+	fNetStream->UserEnroll();
+	
+	if (theRef == NULL)
+    {
+    	fDeviceRefTable->Register(&fRef);
+    	return 0;
+    }
+
+	RefReleaser theRefReleaser(fDeviceRefTable, theRef);
+	MessageDevice* theDevice = (MessageDevice*)theRef->GetObject();
+
+	
+	theDevice->Kill(kSelf);
+	fDeviceRefTable->Swap(&fRef);
+
+	return 0;
+}
+
+
+void MessageDevice::Unenroll()
+{
+	fServer->WriteLog("MessageDevice[%p]: '%s' Unenroll", this, fDeviceID);
+
+	this->PostDeviceUnenroll();
+	fDeviceRefTable->UnRegister(&fRef);
+}
+
+
+void MessageDevice::PostDeviceEnroll()	
+{
+	EnrollReportSession* theSession = NEW EnrollReportSession();
+
+	char* theServerID = fServer->GetServerID();
+	char* theWebIP = fServer->GetWebIP();
+	UInt16 theWebPort = fServer->GetWebPort();
+
+	theSession->ConstructURL(theServerID, NULL, fDeviceID, kDeviceLogin, theWebIP, theWebPort);
+    theSession->Signal(Task::kStartEvent);
+}
+
+
+void MessageDevice::PostDeviceUnenroll()
+{
+	EnrollReportSession* theSession = NEW EnrollReportSession();
+
+	char* theServerID = fServer->GetServerID();
+	char* theWebIP = fServer->GetWebIP();
+	UInt16 theWebPort = fServer->GetWebPort();
+
+	theSession->ConstructURL(theServerID, NULL, fDeviceID, kDeviceLogin, theWebIP, theWebPort);
+    theSession->Signal(Task::kStartEvent);
+}
+
+
+bool MessageDevice::HasClient()
+{
+	Ref* theUserRef = fClientRefTable->Resolve(&fDeviceIDStr);
+	if (theUserRef == NULL)
+		return false;
+
+	fClientRefTable->Release(theUserRef);
+	return true;
+}
+
+
+int MessageDevice::SendPacket(char* inData, UInt32 inLength)
+{
+	return fNetStream->SendPacket(inData, inLength);
+}
+
+
+void MessageDevice::Kill(int theCode)
+{
+	MutexLocker theLocker(&fMutex);
+
+
+	if (theCode == kSelf)
+	{
+		fServer->WriteLog("MessageDevice[%p]: Device '%s' Self Conflict.", this, fDeviceID);
+		fNetStream->SelfConflict();
+	}
+	else if (theCode == kOther)
+	{
+		fServer->WriteLog("MessageDevice[%p]: Device '%s' Other Conflict.", this, fDeviceID);
+		fNetStream->OtherConflict();
+	}
+	else
+	{
+		fServer->WriteLog("MessageDevice[%p]: Device '%s' Exit Normal.", this, fDeviceID);
+		fNetStream->ExitNormal();
+	}
+
+	fNetStream->StopAcceptSendPacket();
+	fNetStream->Signal(Task::kKillEvent);
+}
+
+
+void MessageDevice::KillClient()
+{
+	Ref* theClientRef = fClientRefTable->Resolve(&fDeviceIDStr);
+
+	
+	if (theClientRef == NULL)
+		return ;
+	
+	RefReleaser theReleaser(fClientRefTable, theClientRef); 
+	MessageClient* theUserClientSession = (MessageClient*)theClientRef->GetObject();
+	theUserClientSession->Kill("User", kNone);
+}
+
+
+void MessageDevice::KillAudioDevice()
+{
+	fServer->WriteLog("MessageDevice[%p]: Device '%s' Kill Audio.", this, fDeviceID);
+
+	RefTable* theAudioDeviceRefTable = AServer::GetAudioDeviceRefTable();
+	Ref* theDeviceRef = theAudioDeviceRefTable->Resolve(&fDeviceIDStr);
+
+	
+	if (theDeviceRef == NULL)
+		return ;
+	
+	RefReleaser theReleaser(theAudioDeviceRefTable, theDeviceRef); 
+	MessageDevice* theDevice = (MessageDevice*)theDeviceRef->GetObject();
+	theDevice->Kill(kNone);
+}
+
+
+void MessageDevice::KillVideoDevice()
+{
+	fServer->WriteLog("MessageDevice[%p]: Device '%s' Kill Video.", this, fDeviceID);
+
+	RefTable* theVideoDeviceRefTable = AServer::GetVideoDeviceRefTable();
+	Ref* theDeviceRef = theVideoDeviceRefTable->Resolve(&fDeviceIDStr);
+
+	
+	if (theDeviceRef == NULL)
+		return ;
+	
+	RefReleaser theReleaser(theVideoDeviceRefTable, theDeviceRef); 
+	MessageDevice* theDevice = (MessageDevice*)theDeviceRef->GetObject();
+	theDevice->Kill(kNone);
+}
+
+
+void MessageDevice::Cleanup()
+{
+	this->KillAudioDevice();
+	this->KillVideoDevice();
+	this->KillClient();
+	this->Unenroll();
+}
+
